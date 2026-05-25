@@ -1,6 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
 import { createRoot } from "react-dom/client";
 import ePub from "epubjs";
+import type Book from "epubjs/types/book";
+import type Contents from "epubjs/types/contents";
+import type { Location } from "epubjs/types/rendition";
+import type Rendition from "epubjs/types/rendition";
 import {
   BookOpen,
   Library,
@@ -18,7 +22,7 @@ import "./styles.css";
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
 
-const defaultSettings = {
+const defaultSettings: ReaderSettings = {
   fontSize: 100,
   theme: "dark"
 };
@@ -36,9 +40,53 @@ const readerThemeColors = {
     text: "#ece7dd",
     link: "#d8a465"
   }
-};
+} as const;
 
-function hashText(text) {
+type Theme = keyof typeof readerThemeColors;
+
+type ReaderStatus = "idle" | "loading" | "ready" | "error";
+
+interface ReaderSettings {
+  fontSize: number;
+  theme: Theme;
+}
+
+interface ReadingPosition {
+  cfi: string;
+  href: string;
+  percentage: number | null;
+  isPrecise: boolean;
+  progressMethod: typeof PROGRESS_METHOD;
+  updatedAt: string;
+}
+
+interface LibraryBook {
+  id: string;
+  url: string;
+  title: string;
+  author: string;
+  addedAt: string;
+  updatedAt: string;
+  position: ReadingPosition | null;
+}
+
+interface BookInfo {
+  title: string;
+  author: string;
+}
+
+interface ReaderProgress {
+  href: string;
+  percentage: number | null;
+}
+
+type PersistentState<T> = [T, Dispatch<SetStateAction<T>>];
+
+interface RuntimeSpine {
+  length?: number;
+}
+
+function hashText(text: string): string {
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
     hash ^= text.charCodeAt(index);
@@ -47,20 +95,20 @@ function hashText(text) {
   return `book-${(hash >>> 0).toString(16)}`;
 }
 
-function readJson(key, fallback) {
+function readJson<T>(key: string, fallback: T): T {
   try {
     const rawValue = localStorage.getItem(key);
-    return rawValue ? JSON.parse(rawValue) : fallback;
+    return rawValue ? (JSON.parse(rawValue) as T) : fallback;
   } catch {
     return fallback;
   }
 }
 
-function writeJson(key, value) {
+function writeJson<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
-function convertKnownHostedUrl(url) {
+function convertKnownHostedUrl(url: URL): URL {
   if (url.hostname !== "github.com") {
     return url;
   }
@@ -79,7 +127,7 @@ function convertKnownHostedUrl(url) {
   return url;
 }
 
-function normalizeBookUrl(value) {
+function normalizeBookUrl(value: string): string {
   const trimmedValue = value.trim();
   if (!trimmedValue) {
     return "";
@@ -88,7 +136,7 @@ function normalizeBookUrl(value) {
   return convertKnownHostedUrl(new URL(trimmedValue, window.location.href)).href;
 }
 
-function getQueryBookUrl() {
+function getQueryBookUrl(): string {
   const params = new URLSearchParams(window.location.search);
   const rawUrl = params.get("url") || params.get("book") || params.get("epub") || "";
 
@@ -99,7 +147,7 @@ function getQueryBookUrl() {
   }
 }
 
-function formatAuthor(author) {
+function formatAuthor(author: string | string[] | null | undefined): string {
   if (Array.isArray(author)) {
     return author.filter(Boolean).join(", ");
   }
@@ -107,7 +155,7 @@ function formatAuthor(author) {
   return author || "";
 }
 
-function createBook(url) {
+function createBook(url: string): LibraryBook {
   const now = new Date().toISOString();
 
   return {
@@ -121,7 +169,7 @@ function createBook(url) {
   };
 }
 
-function toDisplayPercentage(value) {
+function toDisplayPercentage(value: number | string | null | undefined): number | null {
   if (value == null || Number.isNaN(Number(value))) {
     return null;
   }
@@ -130,7 +178,7 @@ function toDisplayPercentage(value) {
   return Math.min(100, Math.max(0, Math.round(numericValue * 10) / 10));
 }
 
-function formatProgress(value) {
+function formatProgress(value: number | string | null | undefined): string {
   const percentage = toDisplayPercentage(value);
   if (percentage == null || percentage < 1) {
     return "";
@@ -139,9 +187,9 @@ function formatProgress(value) {
   return `${Number.isInteger(percentage) ? percentage : percentage.toFixed(1)}%`;
 }
 
-function getDisplayedPagePercentage(book, location) {
+function getDisplayedPagePercentage(book: Book, location: Location): number | null {
   const start = location?.start;
-  const spineLength = Number(book?.spine?.length || 0);
+  const spineLength = Number((book.spine as RuntimeSpine).length || 0);
   const sectionIndex = Number(start?.index);
   const page = Number(start?.displayed?.page || 1);
   const totalPages = Number(start?.displayed?.total || 1);
@@ -158,7 +206,7 @@ function getDisplayedPagePercentage(book, location) {
   return toDisplayPercentage(((sectionIndex + sectionProgress) / spineLength) * 100);
 }
 
-function applyContentStyles(contents, settings) {
+function applyContentStyles(contents: Contents, settings: ReaderSettings): void {
   const colors = readerThemeColors[settings.theme] || readerThemeColors.light;
   const documentElement = contents.document?.documentElement;
   const body = contents.document?.body;
@@ -185,17 +233,22 @@ function applyContentStyles(contents, settings) {
   });
 }
 
-function applyReaderPreferences(rendition, settings) {
+function getRenditionContents(rendition: Rendition): Contents[] {
+  const contents = rendition.getContents() as Contents | Contents[];
+  return Array.isArray(contents) ? contents : [contents];
+}
+
+function applyReaderPreferences(rendition: Rendition | null, settings: ReaderSettings): void {
   if (!rendition) {
     return;
   }
 
   rendition.themes.fontSize(`${settings.fontSize}%`);
   rendition.themes.select(settings.theme);
-  rendition.getContents().forEach((contents) => applyContentStyles(contents, settings));
+  getRenditionContents(rendition).forEach((contents) => applyContentStyles(contents, settings));
 }
 
-function usePersistentState(key, fallback) {
+function usePersistentState<T>(key: string, fallback: T): PersistentState<T> {
   const [value, setValue] = useState(() => readJson(key, fallback));
 
   useEffect(() => {
@@ -207,22 +260,22 @@ function usePersistentState(key, fallback) {
 
 function App() {
   const queryBookUrl = useMemo(() => getQueryBookUrl(), []);
-  const [library, setLibrary] = usePersistentState(LIBRARY_KEY, []);
-  const [settings, setSettings] = usePersistentState(SETTINGS_KEY, defaultSettings);
-  const [activeBookId, setActiveBookId] = useState(null);
+  const [library, setLibrary] = usePersistentState<LibraryBook[]>(LIBRARY_KEY, []);
+  const [settings, setSettings] = usePersistentState<ReaderSettings>(SETTINGS_KEY, defaultSettings);
+  const [activeBookId, setActiveBookId] = useState<string | null>(null);
   const [isToolbarOpen, setIsToolbarOpen] = useState(false);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isAddOpen, setIsAddOpen] = useState(!queryBookUrl);
   const [urlInput, setUrlInput] = useState("");
   const [readerError, setReaderError] = useState("");
-  const [readerStatus, setReaderStatus] = useState("idle");
-  const [bookInfo, setBookInfo] = useState(null);
-  const [progress, setProgress] = useState(null);
+  const [readerStatus, setReaderStatus] = useState<ReaderStatus>("idle");
+  const [bookInfo, setBookInfo] = useState<BookInfo | null>(null);
+  const [progress, setProgress] = useState<ReaderProgress | null>(null);
   const [areLocationsReady, setAreLocationsReady] = useState(false);
-  const viewerRef = useRef(null);
-  const bookRef = useRef(null);
-  const renditionRef = useRef(null);
-  const activeBookRef = useRef(null);
+  const viewerRef = useRef<HTMLDivElement | null>(null);
+  const bookRef = useRef<Book | null>(null);
+  const renditionRef = useRef<Rendition | null>(null);
+  const activeBookRef = useRef<LibraryBook | null>(null);
   const settingsRef = useRef(settings);
   const queryBookHandledRef = useRef(false);
 
@@ -239,7 +292,7 @@ function App() {
     settingsRef.current = settings;
   }, [settings]);
 
-  const upsertBook = useCallback((bookUrl, openBook = true) => {
+  const upsertBook = useCallback((bookUrl: string, openBook = true): string => {
     const normalizedUrl = normalizeBookUrl(bookUrl);
     const existingId = hashText(normalizedUrl);
 
@@ -335,7 +388,7 @@ function App() {
     });
 
     renditionRef.current = rendition;
-    rendition.hooks.content.register((contents) => {
+    rendition.hooks.content.register((contents: Contents) => {
       applyContentStyles(contents, settingsRef.current);
     });
 
@@ -367,7 +420,7 @@ function App() {
     });
     applyReaderPreferences(rendition, settingsRef.current);
 
-    const saveReadingLocation = (location) => {
+    const saveReadingLocation = (location: Location) => {
       if (!activeBookRef.current) {
         return;
       }
@@ -403,7 +456,7 @@ function App() {
       setProgress({ href, percentage: percentage ?? null });
     };
 
-    rendition.on("relocated", (location) => {
+    rendition.on("relocated", (location: Location) => {
       saveReadingLocation(location);
     });
 
@@ -453,7 +506,7 @@ function App() {
         }
       });
 
-    const handleKeyDown = (event) => {
+    const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "ArrowLeft") {
         rendition.prev();
       }
@@ -478,7 +531,7 @@ function App() {
     };
   }, [activeBook?.id]);
 
-  const addBookFromInput = (event) => {
+  const addBookFromInput = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     try {
@@ -489,17 +542,17 @@ function App() {
     }
   };
 
-  const openBook = (bookId) => {
+  const openBook = (bookId: string) => {
     setActiveBookId(bookId);
     setIsLibraryOpen(false);
     setIsAddOpen(false);
   };
 
-  const removeBook = (bookId) => {
+  const removeBook = (bookId: string) => {
     setLibrary((currentLibrary) => currentLibrary.filter((book) => book.id !== bookId));
     if (activeBookId === bookId) {
       const nextBook = library.find((book) => book.id !== bookId);
-      setActiveBookId(nextBook?.id || null);
+      setActiveBookId(nextBook?.id ?? null);
       setIsAddOpen(!nextBook);
     }
   };
@@ -507,7 +560,7 @@ function App() {
   const goToPreviousPage = () => renditionRef.current?.prev();
   const goToNextPage = () => renditionRef.current?.next();
 
-  const updateFontSize = (delta) => {
+  const updateFontSize = (delta: number) => {
     setSettings((currentSettings) => ({
       ...currentSettings,
       fontSize: Math.min(150, Math.max(75, currentSettings.fontSize + delta))
@@ -684,4 +737,10 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+const rootElement = document.getElementById("root");
+
+if (!rootElement) {
+  throw new Error("Root element was not found.");
+}
+
+createRoot(rootElement).render(<App />);
