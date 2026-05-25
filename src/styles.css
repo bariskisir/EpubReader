@@ -59,17 +59,17 @@ button {
 .floating-menu-button {
   position: fixed;
   z-index: 24;
-  top: 12px;
-  left: 12px;
+  top: 0;
+  left: 0;
   display: inline-grid;
   place-items: center;
-  width: 42px;
-  height: 42px;
+  width: 32px;
+  height: 32px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 0 0 8px 0;
   background: transparent;
   color: var(--text);
-  opacity: 0.62;
+  opacity: 0.34;
   box-shadow: none;
 }
 
@@ -115,17 +115,17 @@ button {
 
 .toolbar-close-button {
   position: absolute;
-  top: 10px;
-  left: 10px;
+  top: 0;
+  left: 0;
   display: inline-grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 32px;
+  height: 32px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 0 0 8px 0;
   background: transparent;
   color: var(--text);
-  opacity: 0.72;
+  opacity: 0.46;
 }
 
 .toolbar-close-button:hover {
@@ -492,10 +492,10 @@ button {
   }
 
   .floating-menu-button {
-    top: 8px;
-    left: 8px;
-    width: 40px;
-    height: 40px;
+    top: 0;
+    left: 0;
+    width: 32px;
+    height: 32px;
   }
 
   .toolbar-actions {
