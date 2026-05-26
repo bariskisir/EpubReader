@@ -25,7 +25,8 @@ body,
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -244,6 +245,25 @@ button {
   border-color: #2ba761;
   color: #fffaf3;
   background: #1f8a4c;
+}
+
+.language-select {
+  width: 108px;
+  height: 38px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 9px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.language-select:hover,
+.language-select:focus {
+  border-color: var(--accent);
+  outline: 0;
 }
 
 .danger:hover {

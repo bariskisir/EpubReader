@@ -23,11 +23,22 @@ import "./styles.css";
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
 const MAX_SPEECH_CHUNK_LENGTH = 900;
-const SPEECH_LANGUAGE_SAMPLE_PAGES = 5;
+const DEFAULT_SPEECH_LANGUAGE = "en-US";
+const SPEECH_LANGUAGE_OPTIONS = [
+  { value: "en-US", label: "English" },
+  { value: "tr-TR", label: "Turkish" },
+  { value: "de-DE", label: "German" },
+  { value: "fr-FR", label: "French" },
+  { value: "es-ES", label: "Spanish" },
+  { value: "it-IT", label: "Italian" },
+  { value: "ru-RU", label: "Russian" },
+  { value: "ar-SA", label: "Arabic" }
+] as const;
 
 const defaultSettings: ReaderSettings = {
   fontSize: 100,
-  theme: "dark"
+  theme: "dark",
+  speechLanguage: DEFAULT_SPEECH_LANGUAGE
 };
 
 const PROGRESS_METHOD = "displayed-pages-v1";
@@ -53,6 +64,7 @@ type SpeechMode = "idle" | "playing" | "paused" | "unsupported" | "error";
 interface ReaderSettings {
   fontSize: number;
   theme: Theme;
+  speechLanguage?: string;
 }
 
 interface ReadingPosition {
@@ -506,114 +518,6 @@ function createVisibleSpeechSnapshot(rendition: Rendition, location: Location | 
   };
 }
 
-async function sampleSpeechTextFromPages(
-  bookUrl: string,
-  startCfi: string | undefined,
-  viewerElement: HTMLElement | null,
-  settings: ReaderSettings
-): Promise<{ text: string; languageHint: string }> {
-  const container = document.createElement("div");
-  const width = Math.max(320, Math.round(viewerElement?.clientWidth || window.innerWidth || 800));
-  const height = Math.max(320, Math.round(viewerElement?.clientHeight || window.innerHeight || 800));
-
-  container.setAttribute("aria-hidden", "true");
-  container.style.position = "fixed";
-  container.style.left = "-20000px";
-  container.style.top = "0";
-  container.style.width = `${width}px`;
-  container.style.height = `${height}px`;
-  container.style.overflow = "hidden";
-  container.style.opacity = "0";
-  container.style.pointerEvents = "none";
-  document.body.append(container);
-
-  const sampleBook = ePub(bookUrl);
-  const sampleRendition = sampleBook.renderTo(container, {
-    width,
-    height,
-    flow: "paginated",
-    spread: "auto",
-    minSpreadWidth: 900
-  });
-
-  sampleRendition.hooks.content.register((contents: Contents) => {
-    applyContentStyles(contents, settings);
-  });
-
-  try {
-    await sampleBook.ready;
-    await sampleRendition.display(startCfi);
-
-    const sections: { text: string; languageHint: string }[] = [];
-
-    for (let pageIndex = 0; pageIndex < SPEECH_LANGUAGE_SAMPLE_PAGES; pageIndex += 1) {
-      sections.push(createVisibleSpeechSnapshot(sampleRendition, sampleRendition.location));
-      const location = sampleRendition.location;
-      if (location?.atEnd || pageIndex === SPEECH_LANGUAGE_SAMPLE_PAGES - 1) {
-        break;
-      }
-      await sampleRendition.next();
-    }
-
-    return {
-      text: normalizeWhitespace(sections.map((section) => section.text).filter(Boolean).join(" ")),
-      languageHint: sections.find((section) => section.languageHint)?.languageHint || ""
-    };
-  } finally {
-    sampleRendition.destroy();
-    sampleBook.destroy();
-    container.remove();
-  }
-}
-
-function detectLanguageFromText(text: string, languageHint: string): string {
-  const normalizedText = text.toLowerCase();
-  const explicitLanguage = normalizeLanguageTag(languageHint);
-
-  if (/[\u3040-\u30ff]/.test(text)) return "ja-JP";
-  if (/[\uac00-\ud7af]/.test(text)) return "ko-KR";
-  if (/[\u4e00-\u9fff]/.test(text)) return "zh-CN";
-  if (/[\u0400-\u04ff]/.test(text)) return "ru-RU";
-  if (/[\u0370-\u03ff]/.test(text)) return "el-GR";
-  if (/[\u0600-\u06ff]/.test(text)) return "ar-SA";
-  if (/[\u0590-\u05ff]/.test(text)) return "he-IL";
-  if (
-    /[\u00e7\u011f\u0131\u00f6\u015f\u00fc]/i.test(text) ||
-    /\b(bir|ve|bu|de|da|ile|i\u00e7in|olarak|ama|\u00e7ok|daha|olan|olan|diye|gibi|sonra|kadar|ben|sen|biz|siz)\b/.test(
-      normalizedText
-    )
-  ) {
-    return "tr-TR";
-  }
-  if (explicitLanguage) {
-    const explicitBaseLanguage = explicitLanguage.toLowerCase().split("-")[0];
-    if (explicitBaseLanguage === "tr") {
-      return "tr-TR";
-    }
-    if (explicitBaseLanguage === "en") {
-      return "en-US";
-    }
-    return explicitLanguage;
-  }
-  if (/[\u00f1\u00bf\u00a1]/i.test(text) || /\b(el|la|los|las|que|para|con|una|del)\b/.test(normalizedText)) {
-    return "es-ES";
-  }
-  if (
-    /[\u00e0\u00e2\u00e7\u00e9\u00e8\u00ea\u00eb\u00ee\u00ef\u00f4\u00f9\u00fb\u00fc\u00ff\u0153]/i.test(text) ||
-    /\b(le|la|les|des|une|pour|avec|dans)\b/.test(normalizedText)
-  ) {
-    return "fr-FR";
-  }
-  if (/[\u00e4\u00f6\u00fc\u00df]/i.test(text) || /\b(der|die|das|und|nicht|mit|ist|ein)\b/.test(normalizedText)) {
-    return "de-DE";
-  }
-  if (/\b(il|lo|la|gli|che|per|con|una|del)\b/.test(normalizedText)) {
-    return "it-IT";
-  }
-
-  return "en-US";
-}
-
 function selectVoiceForLanguage(language: string, voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
   const requestedLanguage = language.toLowerCase();
   const requestedBaseLanguage = requestedLanguage.split("-")[0];
@@ -707,7 +611,6 @@ function App() {
   const [readerError, setReaderError] = useState("");
   const [readerStatus, setReaderStatus] = useState<ReaderStatus>("idle");
   const [speechMode, setSpeechMode] = useState<SpeechMode>(() => (isSpeechSupported() ? "idle" : "unsupported"));
-  const [speechLanguage, setSpeechLanguage] = useState("");
   const [bookInfo, setBookInfo] = useState<BookInfo | null>(null);
   const [progress, setProgress] = useState<ReaderProgress | null>(null);
   const [areLocationsReady, setAreLocationsReady] = useState(false);
@@ -720,14 +623,13 @@ function App() {
   const lastLocationRef = useRef<Location | null>(null);
   const speechChunksRef = useRef<string[]>([]);
   const speechChunkIndexRef = useRef(0);
-  const speechLanguageRef = useRef("");
+  const speechLanguageRef = useRef(settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE);
   const speechVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const speechPageKeyRef = useRef("");
   const speechShouldContinueRef = useRef(false);
   const speechTokenRef = useRef(0);
   const speechPageAdvanceTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<ScreenWakeLockSentinel | null>(null);
-  const languageDetectionTokenRef = useRef(0);
   const pageHoldTimerRef = useRef<number | null>(null);
   const pageHoldIntervalRef = useRef<number | null>(null);
   const pageHoldDidRepeatRef = useRef(false);
@@ -743,6 +645,16 @@ function App() {
 
   useEffect(() => {
     settingsRef.current = settings;
+    const nextLanguage = settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE;
+    speechLanguageRef.current = nextLanguage;
+    if (isSpeechSupported()) {
+      speechVoiceRef.current = selectVoiceForLanguage(nextLanguage, window.speechSynthesis.getVoices());
+      void getSpeechVoices().then((voices) => {
+        if (speechLanguageRef.current === nextLanguage) {
+          speechVoiceRef.current = selectVoiceForLanguage(nextLanguage, voices);
+        }
+      });
+    }
   }, [settings]);
 
   useEffect(() => {
@@ -831,9 +743,6 @@ function App() {
 
     void releaseSpeechWakeLock();
     setSpeechMode(nextMode);
-    if (nextMode === "idle" || nextMode === "unsupported") {
-      setSpeechLanguage("");
-    }
   }
 
   function resetSpeechForManualPageChange(): void {
@@ -852,51 +761,6 @@ function App() {
 
   function getCurrentSpeechLocation(): Location | null {
     return lastLocationRef.current || renditionRef.current?.location || null;
-  }
-
-  async function detectSpeechLanguageFromBookStart(bookUrl: string): Promise<void> {
-    const token = languageDetectionTokenRef.current + 1;
-    languageDetectionTokenRef.current = token;
-
-    try {
-      const currentLocation = getCurrentSpeechLocation();
-      const currentSnapshot = renditionRef.current
-        ? createVisibleSpeechSnapshot(renditionRef.current, currentLocation)
-        : { text: "", languageHint: "", pageKey: "" };
-      const sample = await sampleSpeechTextFromPages(bookUrl, undefined, viewerRef.current, settingsRef.current);
-      const language = detectLanguageFromText(
-        sample.text || currentSnapshot.text,
-        sample.languageHint || currentSnapshot.languageHint
-      );
-      const voices = isSpeechSupported() ? await getSpeechVoices() : [];
-
-      if (languageDetectionTokenRef.current !== token || activeBookRef.current?.url !== bookUrl) {
-        return;
-      }
-
-      speechLanguageRef.current = language;
-      speechVoiceRef.current = selectVoiceForLanguage(language, voices);
-      setSpeechLanguage(language);
-    } catch {
-      if (languageDetectionTokenRef.current !== token || activeBookRef.current?.url !== bookUrl) {
-        return;
-      }
-
-      const currentLocation = getCurrentSpeechLocation();
-      const snapshot = renditionRef.current
-        ? createVisibleSpeechSnapshot(renditionRef.current, currentLocation)
-        : { text: "", languageHint: "", pageKey: "" };
-      const fallbackLanguage = detectLanguageFromText(snapshot.text, snapshot.languageHint);
-      const voices = isSpeechSupported() ? await getSpeechVoices() : [];
-
-      if (languageDetectionTokenRef.current !== token || activeBookRef.current?.url !== bookUrl) {
-        return;
-      }
-
-      speechLanguageRef.current = fallbackLanguage;
-      speechVoiceRef.current = selectVoiceForLanguage(fallbackLanguage, voices);
-      setSpeechLanguage(fallbackLanguage);
-    }
   }
 
   function speakSpeechChunks(startIndex = 0): void {
@@ -945,7 +809,7 @@ function App() {
       }
 
       const utterance = new SpeechSynthesisUtterance(chunks[index]);
-      utterance.lang = speechLanguageRef.current || "en-US";
+      utterance.lang = speechLanguageRef.current || DEFAULT_SPEECH_LANGUAGE;
       if (speechVoiceRef.current) {
         utterance.voice = speechVoiceRef.current;
       }
@@ -1049,12 +913,11 @@ function App() {
       return;
     }
 
-    const initialLanguage = speechLanguageRef.current || detectLanguageFromText(currentSnapshot.text, currentSnapshot.languageHint);
+    const initialLanguage = speechLanguageRef.current || DEFAULT_SPEECH_LANGUAGE;
     const currentPageKey = currentSnapshot.pageKey;
 
     speechLanguageRef.current = initialLanguage;
     speechVoiceRef.current = selectVoiceForLanguage(initialLanguage, window.speechSynthesis.getVoices());
-    setSpeechLanguage(initialLanguage);
     speechChunksRef.current = splitSpeechText(currentSnapshot.text);
     speechChunkIndexRef.current = 0;
     speechPageKeyRef.current = currentPageKey;
@@ -1133,10 +996,6 @@ function App() {
     setBookInfo(null);
     setProgress(null);
     setAreLocationsReady(false);
-    setSpeechLanguage("");
-    speechLanguageRef.current = "";
-    speechVoiceRef.current = null;
-    languageDetectionTokenRef.current += 1;
     lastLocationRef.current = null;
     stopSpeech();
     container.replaceChildren();
@@ -1289,7 +1148,6 @@ function App() {
       .then(() => {
         if (!cancelled) {
           setReaderStatus("ready");
-          void detectSpeechLanguageFromBookStart(activeBook.url);
         }
       })
       .catch(() => {
@@ -1316,7 +1174,6 @@ function App() {
 
     return () => {
       cancelled = true;
-      languageDetectionTokenRef.current += 1;
       clearPageHoldNavigation();
       stopSpeech();
       window.removeEventListener("keydown", handleKeyDown);
@@ -1437,8 +1294,28 @@ function App() {
     }));
   };
 
+  const updateSpeechLanguage = (language: string) => {
+    speechLanguageRef.current = language;
+    if (isSpeechSupported()) {
+      speechVoiceRef.current = selectVoiceForLanguage(language, window.speechSynthesis.getVoices());
+      void getSpeechVoices().then((voices) => {
+        if (speechLanguageRef.current === language) {
+          speechVoiceRef.current = selectVoiceForLanguage(language, voices);
+        }
+      });
+    }
+    setSettings((currentSettings) => ({
+      ...currentSettings,
+      speechLanguage: language
+    }));
+    if (speechMode === "playing" || speechMode === "paused") {
+      stopSpeech();
+    }
+  };
+
   const readerTitle = bookInfo?.title || activeBook?.title || "EPUB Reader";
   const readerAuthor = bookInfo?.author || activeBook?.author || "";
+  const selectedSpeechLanguage = settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE;
   const currentProgress = areLocationsReady
     ? progress?.percentage ??
       (activeBook?.position?.isPrecise && activeBook.position.progressMethod === PROGRESS_METHOD
@@ -1458,8 +1335,8 @@ function App() {
     speechMode === "unsupported"
       ? "Read aloud is not supported in this browser"
       : speechMode === "playing"
-        ? `Pause read aloud${speechLanguage ? ` (${speechLanguage})` : ""}`
-        : `Read this page aloud${speechLanguage ? ` (${speechLanguage})` : ""}`;
+        ? `Pause read aloud (${selectedSpeechLanguage})`
+        : `Read this page aloud (${selectedSpeechLanguage})`;
   const isSpeechButtonDisabled = !activeBook || readerStatus !== "ready" || speechMode === "unsupported";
 
   useEffect(() => {
@@ -1510,6 +1387,19 @@ function App() {
           <button type="button" className="icon-button" onClick={() => setIsAddOpen(true)} title="Add EPUB">
             <Plus aria-hidden="true" size={20} />
           </button>
+          <select
+            className="language-select"
+            value={selectedSpeechLanguage}
+            onChange={(event) => updateSpeechLanguage(event.currentTarget.value)}
+            title="Read aloud language"
+            aria-label="Read aloud language"
+          >
+            {SPEECH_LANGUAGE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
           <div className="control-group" aria-label="Font size">
             <button type="button" className="icon-button" onClick={() => updateFontSize(-5)} title="Smaller text">
               <Minus aria-hidden="true" size={18} />
