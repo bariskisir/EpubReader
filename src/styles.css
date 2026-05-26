@@ -217,6 +217,28 @@ button {
   color: var(--accent-strong);
 }
 
+.icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.icon-button:disabled:hover {
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.speech-button.active {
+  border-color: #1f8a4c;
+  color: #fffaf3;
+  background: #237a46;
+}
+
+.speech-button.active:hover {
+  border-color: #2ba761;
+  color: #fffaf3;
+  background: #1f8a4c;
+}
+
 .danger:hover {
   border-color: var(--danger);
   color: var(--danger);

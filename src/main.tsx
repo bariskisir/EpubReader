@@ -11,6 +11,8 @@ import {
   Menu,
   Minus,
   Moon,
+  Pause,
+  Play,
   Plus,
   Sun,
   Trash2,
@@ -21,6 +23,8 @@ import "./styles.css";
 
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
+const MAX_SPEECH_CHUNK_LENGTH = 900;
+const SPEECH_LANGUAGE_SAMPLE_PAGES = 5;
 
 const defaultSettings: ReaderSettings = {
   fontSize: 100,
@@ -45,6 +49,7 @@ const readerThemeColors = {
 type Theme = keyof typeof readerThemeColors;
 
 type ReaderStatus = "idle" | "loading" | "ready" | "error";
+type SpeechMode = "idle" | "playing" | "paused" | "unsupported" | "error";
 
 interface ReaderSettings {
   fontSize: number;
@@ -84,6 +89,23 @@ type PersistentState<T> = [T, Dispatch<SetStateAction<T>>];
 
 interface RuntimeSpine {
   length?: number;
+}
+
+interface VisibleSpeechSnapshot {
+  text: string;
+  languageHint: string;
+  pageKey: string;
+}
+
+interface ScreenWakeLockSentinel {
+  release(): Promise<void>;
+  addEventListener(type: "release", listener: () => void): void;
+}
+
+interface BrowserWithScreenWakeLock {
+  wakeLock?: {
+    request(type: "screen"): Promise<ScreenWakeLockSentinel>;
+  };
 }
 
 function hashText(text: string): string {
@@ -248,6 +270,360 @@ function applyReaderPreferences(rendition: Rendition | null, settings: ReaderSet
   getRenditionContents(rendition).forEach((contents) => applyContentStyles(contents, settings));
 }
 
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function isSpeechSupported(): boolean {
+  return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+}
+
+function normalizeLanguageTag(value: string | null | undefined): string {
+  const normalizedValue = value?.trim();
+  if (!normalizedValue) {
+    return "";
+  }
+
+  try {
+    return new Intl.Locale(normalizedValue).toString();
+  } catch {
+    return normalizedValue;
+  }
+}
+
+function getLanguageHintFromElement(element: Element | null): string {
+  const languageElement = element?.closest?.("[lang]");
+  return normalizeLanguageTag(languageElement?.getAttribute("lang") || element?.ownerDocument?.documentElement.lang);
+}
+
+function isReadableTextNode(node: Node): boolean {
+  const parentElement = node.parentElement;
+  const tagName = parentElement?.tagName.toLowerCase();
+
+  if (!parentElement || !node.textContent?.trim()) {
+    return false;
+  }
+
+  if (tagName && ["script", "style", "noscript", "svg", "title", "meta"].includes(tagName)) {
+    return false;
+  }
+
+  const view = parentElement.ownerDocument.defaultView;
+  const computedStyle = view?.getComputedStyle(parentElement);
+  return computedStyle?.display !== "none" && computedStyle?.visibility !== "hidden";
+}
+
+function isTextNodeInViewport(node: Text, document: Document): boolean {
+  const view = document.defaultView;
+  if (!view) {
+    return false;
+  }
+
+  const viewportWidth = view.innerWidth || document.documentElement.clientWidth;
+  const viewportHeight = view.innerHeight || document.documentElement.clientHeight;
+  const range = document.createRange();
+
+  try {
+    range.selectNodeContents(node);
+    return Array.from(range.getClientRects()).some(
+      (rect) =>
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.right > 0 &&
+        rect.bottom > 0 &&
+        rect.left < viewportWidth &&
+        rect.top < viewportHeight
+    );
+  } finally {
+    range.detach();
+  }
+}
+
+function extractVisibleSpeechText(document: Document): { text: string; languageHint: string } {
+  const body = document.body;
+  if (!body) {
+    return { text: "", languageHint: normalizeLanguageTag(document.documentElement.lang) };
+  }
+
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!isReadableTextNode(node) || !isTextNodeInViewport(node as Text, document)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  const parts: string[] = [];
+  let languageHint = normalizeLanguageTag(document.documentElement.lang || body.getAttribute("lang"));
+  let currentNode = walker.nextNode();
+
+  while (currentNode) {
+    const text = normalizeWhitespace(currentNode.textContent || "");
+    if (text) {
+      parts.push(text);
+      if (!languageHint) {
+        languageHint = getLanguageHintFromElement(currentNode.parentElement);
+      }
+    }
+    currentNode = walker.nextNode();
+  }
+
+  return {
+    text: normalizeWhitespace(parts.join(" ")),
+    languageHint
+  };
+}
+
+function getElementFromNode(node: Node): Element | null {
+  return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+}
+
+function extractLocationSpeechText(rendition: Rendition, location: Location | null): { text: string; languageHint: string } {
+  const startCfi = location?.start?.cfi;
+  const endCfi = location?.end?.cfi;
+  if (!startCfi || !endCfi) {
+    return { text: "", languageHint: "" };
+  }
+
+  try {
+    const startRange = rendition.getRange(startCfi);
+    const endRange = rendition.getRange(endCfi);
+    const startDocument = startRange.startContainer.ownerDocument;
+    const endDocument = endRange.endContainer.ownerDocument;
+
+    if (!startDocument || startDocument !== endDocument) {
+      return { text: "", languageHint: "" };
+    }
+
+    const pageRange = startDocument.createRange();
+    try {
+      pageRange.setStart(startRange.startContainer, startRange.startOffset);
+      pageRange.setEnd(endRange.endContainer, endRange.endOffset);
+    } catch {
+      pageRange.detach();
+      return { text: "", languageHint: "" };
+    }
+
+    const languageHint = getLanguageHintFromElement(getElementFromNode(pageRange.commonAncestorContainer));
+    const text = normalizeWhitespace(pageRange.cloneContents().textContent || "");
+    pageRange.detach();
+
+    return { text, languageHint };
+  } catch {
+    return { text: "", languageHint: "" };
+  }
+}
+
+function getLocationSpeechKey(location: Location | null): string {
+  const start = location?.start;
+  if (!start) {
+    return "";
+  }
+
+  return [start.href || "", start.displayed?.page || "", start.displayed?.total || "", start.cfi || ""].join(":");
+}
+
+function createVisibleSpeechSnapshot(rendition: Rendition, location: Location | null): VisibleSpeechSnapshot {
+  if (location) {
+    const locationText = extractLocationSpeechText(rendition, location);
+    return {
+      text: locationText.text,
+      languageHint: locationText.languageHint,
+      pageKey: getLocationSpeechKey(location)
+    };
+  }
+
+  const sections = getRenditionContents(rendition).map((contents) => extractVisibleSpeechText(contents.document));
+  const languageHint = sections.find((section) => section.languageHint)?.languageHint || "";
+
+  return {
+    text: normalizeWhitespace(sections.map((section) => section.text).filter(Boolean).join("\n\n")),
+    languageHint,
+    pageKey: getLocationSpeechKey(location)
+  };
+}
+
+async function sampleSpeechTextFromFollowingPages(
+  bookUrl: string,
+  startCfi: string | undefined,
+  viewerElement: HTMLElement | null,
+  settings: ReaderSettings
+): Promise<{ text: string; languageHint: string }> {
+  const container = document.createElement("div");
+  const width = Math.max(320, Math.round(viewerElement?.clientWidth || window.innerWidth || 800));
+  const height = Math.max(320, Math.round(viewerElement?.clientHeight || window.innerHeight || 800));
+
+  container.setAttribute("aria-hidden", "true");
+  container.style.position = "fixed";
+  container.style.left = "-20000px";
+  container.style.top = "0";
+  container.style.width = `${width}px`;
+  container.style.height = `${height}px`;
+  container.style.overflow = "hidden";
+  container.style.opacity = "0";
+  container.style.pointerEvents = "none";
+  document.body.append(container);
+
+  const sampleBook = ePub(bookUrl);
+  const sampleRendition = sampleBook.renderTo(container, {
+    width,
+    height,
+    flow: "paginated",
+    spread: "auto",
+    minSpreadWidth: 900
+  });
+
+  sampleRendition.hooks.content.register((contents: Contents) => {
+    applyContentStyles(contents, settings);
+  });
+
+  try {
+    await sampleBook.ready;
+    await sampleRendition.display(startCfi);
+
+    const sections: { text: string; languageHint: string }[] = [];
+
+    for (let pageIndex = 0; pageIndex < SPEECH_LANGUAGE_SAMPLE_PAGES; pageIndex += 1) {
+      sections.push(createVisibleSpeechSnapshot(sampleRendition, sampleRendition.location));
+      const location = sampleRendition.location;
+      if (location?.atEnd || pageIndex === SPEECH_LANGUAGE_SAMPLE_PAGES - 1) {
+        break;
+      }
+      await sampleRendition.next();
+    }
+
+    return {
+      text: normalizeWhitespace(sections.map((section) => section.text).filter(Boolean).join(" ")),
+      languageHint: sections.find((section) => section.languageHint)?.languageHint || ""
+    };
+  } finally {
+    sampleRendition.destroy();
+    sampleBook.destroy();
+    container.remove();
+  }
+}
+
+function detectLanguageFromText(text: string, languageHint: string): string {
+  const normalizedText = text.toLowerCase();
+  const explicitLanguage = normalizeLanguageTag(languageHint);
+
+  if (/[\u3040-\u30ff]/.test(text)) return "ja-JP";
+  if (/[\uac00-\ud7af]/.test(text)) return "ko-KR";
+  if (/[\u4e00-\u9fff]/.test(text)) return "zh-CN";
+  if (/[\u0400-\u04ff]/.test(text)) return "ru-RU";
+  if (/[\u0370-\u03ff]/.test(text)) return "el-GR";
+  if (/[\u0600-\u06ff]/.test(text)) return "ar-SA";
+  if (/[\u0590-\u05ff]/.test(text)) return "he-IL";
+  if (
+    /[\u00e7\u011f\u0131\u00f6\u015f\u00fc]/i.test(text) ||
+    /\b(bir|ve|bu|de|da|ile|i\u00e7in|olarak|ama|\u00e7ok|daha|olan|olan|diye|gibi|sonra|kadar|ben|sen|biz|siz)\b/.test(
+      normalizedText
+    )
+  ) {
+    return "tr-TR";
+  }
+  if (explicitLanguage) {
+    const explicitBaseLanguage = explicitLanguage.toLowerCase().split("-")[0];
+    if (explicitBaseLanguage === "tr") {
+      return "tr-TR";
+    }
+    if (explicitBaseLanguage === "en") {
+      return "en-US";
+    }
+    return explicitLanguage;
+  }
+  if (/[\u00f1\u00bf\u00a1]/i.test(text) || /\b(el|la|los|las|que|para|con|una|del)\b/.test(normalizedText)) {
+    return "es-ES";
+  }
+  if (
+    /[\u00e0\u00e2\u00e7\u00e9\u00e8\u00ea\u00eb\u00ee\u00ef\u00f4\u00f9\u00fb\u00fc\u00ff\u0153]/i.test(text) ||
+    /\b(le|la|les|des|une|pour|avec|dans)\b/.test(normalizedText)
+  ) {
+    return "fr-FR";
+  }
+  if (/[\u00e4\u00f6\u00fc\u00df]/i.test(text) || /\b(der|die|das|und|nicht|mit|ist|ein)\b/.test(normalizedText)) {
+    return "de-DE";
+  }
+  if (/\b(il|lo|la|gli|che|per|con|una|del)\b/.test(normalizedText)) {
+    return "it-IT";
+  }
+
+  return "en-US";
+}
+
+function selectVoiceForLanguage(language: string, voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
+  const requestedLanguage = language.toLowerCase();
+  const requestedBaseLanguage = requestedLanguage.split("-")[0];
+
+  return (
+    voices.find((voice) => voice.lang.toLowerCase() === requestedLanguage) ||
+    voices.find((voice) => voice.lang.toLowerCase().startsWith(`${requestedBaseLanguage}-`)) ||
+    null
+  );
+}
+
+function getSpeechVoices(): Promise<SpeechSynthesisVoice[]> {
+  const voices = window.speechSynthesis.getVoices();
+  if (voices.length > 0) {
+    return Promise.resolve(voices);
+  }
+
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(() => {
+      window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+      resolve(window.speechSynthesis.getVoices());
+    }, 900);
+
+    function handleVoicesChanged() {
+      window.clearTimeout(timeout);
+      window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+      resolve(window.speechSynthesis.getVoices());
+    }
+
+    window.speechSynthesis.addEventListener("voiceschanged", handleVoicesChanged);
+  });
+}
+
+function splitSpeechText(text: string): string[] {
+  const sentences = normalizeWhitespace(text).match(/[^.!?\u3002\uff01\uff1f]+[.!?\u3002\uff01\uff1f]?/g) || [text];
+  const chunks: string[] = [];
+  let currentChunk = "";
+
+  sentences.forEach((sentence) => {
+    const normalizedSentence = normalizeWhitespace(sentence);
+    if (!normalizedSentence) {
+      return;
+    }
+
+    if (`${currentChunk} ${normalizedSentence}`.trim().length <= MAX_SPEECH_CHUNK_LENGTH) {
+      currentChunk = `${currentChunk} ${normalizedSentence}`.trim();
+      return;
+    }
+
+    if (currentChunk) {
+      chunks.push(currentChunk);
+    }
+
+    if (normalizedSentence.length <= MAX_SPEECH_CHUNK_LENGTH) {
+      currentChunk = normalizedSentence;
+      return;
+    }
+
+    for (let index = 0; index < normalizedSentence.length; index += MAX_SPEECH_CHUNK_LENGTH) {
+      chunks.push(normalizedSentence.slice(index, index + MAX_SPEECH_CHUNK_LENGTH));
+    }
+    currentChunk = "";
+  });
+
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
 function usePersistentState<T>(key: string, fallback: T): PersistentState<T> {
   const [value, setValue] = useState(() => readJson(key, fallback));
 
@@ -269,6 +645,8 @@ function App() {
   const [urlInput, setUrlInput] = useState("");
   const [readerError, setReaderError] = useState("");
   const [readerStatus, setReaderStatus] = useState<ReaderStatus>("idle");
+  const [speechMode, setSpeechMode] = useState<SpeechMode>(() => (isSpeechSupported() ? "idle" : "unsupported"));
+  const [speechLanguage, setSpeechLanguage] = useState("");
   const [bookInfo, setBookInfo] = useState<BookInfo | null>(null);
   const [progress, setProgress] = useState<ReaderProgress | null>(null);
   const [areLocationsReady, setAreLocationsReady] = useState(false);
@@ -278,6 +656,16 @@ function App() {
   const activeBookRef = useRef<LibraryBook | null>(null);
   const settingsRef = useRef(settings);
   const queryBookHandledRef = useRef(false);
+  const lastLocationRef = useRef<Location | null>(null);
+  const speechChunksRef = useRef<string[]>([]);
+  const speechChunkIndexRef = useRef(0);
+  const speechLanguageRef = useRef("");
+  const speechVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const speechPageKeyRef = useRef("");
+  const speechShouldContinueRef = useRef(false);
+  const speechTokenRef = useRef(0);
+  const speechPageAdvanceTimerRef = useRef<number | null>(null);
+  const wakeLockRef = useRef<ScreenWakeLockSentinel | null>(null);
 
   const activeBook = useMemo(
     () => library.find((book) => book.id === activeBookId) || null,
@@ -291,6 +679,281 @@ function App() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  function clearSpeechPageAdvanceTimer(): void {
+    if (speechPageAdvanceTimerRef.current == null) {
+      return;
+    }
+
+    window.clearTimeout(speechPageAdvanceTimerRef.current);
+    speechPageAdvanceTimerRef.current = null;
+  }
+
+  async function releaseSpeechWakeLock(): Promise<void> {
+    const wakeLock = wakeLockRef.current;
+    if (!wakeLock) {
+      return;
+    }
+
+    wakeLockRef.current = null;
+    try {
+      await wakeLock.release();
+    } catch {
+      // The browser may already have released it.
+    }
+  }
+
+  async function requestSpeechWakeLock(): Promise<void> {
+    const wakeLock = (navigator as unknown as BrowserWithScreenWakeLock).wakeLock;
+    if (!wakeLock || wakeLockRef.current) {
+      return;
+    }
+
+    try {
+      const sentinel = await wakeLock.request("screen");
+      wakeLockRef.current = sentinel;
+      sentinel.addEventListener("release", () => {
+        if (wakeLockRef.current === sentinel) {
+          wakeLockRef.current = null;
+        }
+      });
+    } catch {
+      // Wake Lock is best-effort and unavailable in some mobile browsers.
+    }
+  }
+
+  function stopSpeech(nextMode: SpeechMode = isSpeechSupported() ? "idle" : "unsupported"): void {
+    speechTokenRef.current += 1;
+    speechShouldContinueRef.current = false;
+    speechChunksRef.current = [];
+    speechChunkIndexRef.current = 0;
+    speechPageKeyRef.current = "";
+    clearSpeechPageAdvanceTimer();
+
+    if (isSpeechSupported()) {
+      window.speechSynthesis.cancel();
+    }
+
+    void releaseSpeechWakeLock();
+    setSpeechMode(nextMode);
+    if (nextMode === "idle" || nextMode === "unsupported") {
+      setSpeechLanguage("");
+    }
+  }
+
+  function resetSpeechForManualPageChange(): void {
+    if (
+      speechMode === "idle" &&
+      speechChunksRef.current.length === 0 &&
+      !speechShouldContinueRef.current &&
+      !window.speechSynthesis?.speaking &&
+      !window.speechSynthesis?.paused
+    ) {
+      return;
+    }
+
+    stopSpeech();
+  }
+
+  function getCurrentSpeechLocation(): Location | null {
+    return lastLocationRef.current || renditionRef.current?.location || null;
+  }
+
+  function speakSpeechChunks(startIndex = 0): void {
+    if (!isSpeechSupported()) {
+      setSpeechMode("unsupported");
+      return;
+    }
+
+    const chunks = speechChunksRef.current;
+    if (chunks.length === 0) {
+      setSpeechMode("error");
+      return;
+    }
+
+    const token = speechTokenRef.current + 1;
+    speechTokenRef.current = token;
+    speechChunkIndexRef.current = startIndex;
+    clearSpeechPageAdvanceTimer();
+    void requestSpeechWakeLock();
+
+    const speakAt = (index: number) => {
+      if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+        return;
+      }
+
+      if (index >= chunks.length) {
+        const rendition = renditionRef.current;
+        const currentLocation = getCurrentSpeechLocation();
+        if (!rendition || currentLocation?.atEnd) {
+          stopSpeech("idle");
+          return;
+        }
+
+        rendition.next().then(() => {
+          if (token !== speechTokenRef.current || !speechShouldContinueRef.current || window.speechSynthesis.paused) {
+            return;
+          }
+
+          speechPageAdvanceTimerRef.current = window.setTimeout(() => {
+            if (token === speechTokenRef.current && speechShouldContinueRef.current && !window.speechSynthesis.paused) {
+              startSpeechForCurrentPage();
+            }
+          }, 180);
+        });
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(chunks[index]);
+      utterance.lang = speechLanguageRef.current || "en-US";
+      if (speechVoiceRef.current) {
+        utterance.voice = speechVoiceRef.current;
+      }
+
+      utterance.onend = () => {
+        if (token !== speechTokenRef.current || !speechShouldContinueRef.current || window.speechSynthesis.paused) {
+          return;
+        }
+
+        speechChunkIndexRef.current = index + 1;
+        speakAt(index + 1);
+      };
+
+      utterance.onerror = (event) => {
+        if (token !== speechTokenRef.current || event.error === "interrupted" || event.error === "canceled") {
+          return;
+        }
+
+        stopSpeech("error");
+      };
+
+      setSpeechMode("playing");
+      window.speechSynthesis.speak(utterance);
+    };
+
+    window.speechSynthesis.cancel();
+    speakAt(startIndex);
+  }
+
+  function startSpeechForCurrentPage(): void {
+    const rendition = renditionRef.current;
+    if (!rendition) {
+      stopSpeech("idle");
+      return;
+    }
+
+    const currentLocation = getCurrentSpeechLocation();
+    const snapshot = createVisibleSpeechSnapshot(rendition, currentLocation);
+    if (!snapshot.text) {
+      if (currentLocation?.atEnd) {
+        stopSpeech("idle");
+        return;
+      }
+
+      rendition.next().then(() => {
+        if (speechShouldContinueRef.current && !window.speechSynthesis.paused) {
+          startSpeechForCurrentPage();
+        }
+      });
+      return;
+    }
+
+    speechChunksRef.current = splitSpeechText(snapshot.text);
+    speechChunkIndexRef.current = 0;
+    speechPageKeyRef.current = snapshot.pageKey;
+    speakSpeechChunks(0);
+  }
+
+  async function toggleSpeech(): Promise<void> {
+    if (!isSpeechSupported()) {
+      setSpeechMode("unsupported");
+      return;
+    }
+
+    if (speechMode === "playing") {
+      window.speechSynthesis.pause();
+      setSpeechMode("paused");
+      void releaseSpeechWakeLock();
+      return;
+    }
+
+    if (speechMode === "paused") {
+      speechShouldContinueRef.current = true;
+      window.speechSynthesis.resume();
+      window.speechSynthesis.cancel();
+      speechChunksRef.current = [];
+      speechChunkIndexRef.current = 0;
+      speechPageKeyRef.current = "";
+
+      if (speechLanguageRef.current) {
+        setSpeechMode("playing");
+        startSpeechForCurrentPage();
+        void requestSpeechWakeLock();
+        return;
+      }
+    }
+
+    const activeBookForSpeech = activeBookRef.current;
+    const rendition = renditionRef.current;
+    if (!activeBookForSpeech || !rendition || readerStatus !== "ready") {
+      return;
+    }
+
+    setSpeechMode("playing");
+    speechShouldContinueRef.current = true;
+
+    const currentLocation = getCurrentSpeechLocation();
+    const currentSnapshot = createVisibleSpeechSnapshot(rendition, currentLocation);
+    if (!currentSnapshot.text) {
+      stopSpeech("error");
+      return;
+    }
+
+    const initialLanguage = detectLanguageFromText(currentSnapshot.text, currentSnapshot.languageHint);
+    const currentPageKey = currentSnapshot.pageKey;
+
+    speechLanguageRef.current = initialLanguage;
+    speechVoiceRef.current = selectVoiceForLanguage(initialLanguage, window.speechSynthesis.getVoices());
+    setSpeechLanguage(initialLanguage);
+    speechChunksRef.current = splitSpeechText(currentSnapshot.text);
+    speechChunkIndexRef.current = 0;
+    speechPageKeyRef.current = currentPageKey;
+    speakSpeechChunks(0);
+
+    try {
+      const sample = await sampleSpeechTextFromFollowingPages(
+        activeBookForSpeech.url,
+        currentLocation?.start?.cfi || activeBookForSpeech.position?.cfi,
+        viewerRef.current,
+        settingsRef.current
+      );
+      const language = detectLanguageFromText(
+        sample.text || currentSnapshot.text,
+        sample.languageHint || currentSnapshot.languageHint
+      );
+      const voices = await getSpeechVoices();
+      const voice = selectVoiceForLanguage(language, voices);
+
+      if (!speechShouldContinueRef.current || speechPageKeyRef.current !== currentPageKey) {
+        return;
+      }
+
+      speechLanguageRef.current = language;
+      speechVoiceRef.current = voice;
+      setSpeechLanguage(language);
+    } catch {
+      const fallbackLanguage = detectLanguageFromText(currentSnapshot.text, currentSnapshot.languageHint);
+      const voices = await getSpeechVoices();
+
+      if (!speechShouldContinueRef.current || speechPageKeyRef.current !== currentPageKey) {
+        return;
+      }
+
+      speechLanguageRef.current = fallbackLanguage;
+      speechVoiceRef.current = selectVoiceForLanguage(fallbackLanguage, voices);
+      setSpeechLanguage(fallbackLanguage);
+    }
+  }
 
   const upsertBook = useCallback((bookUrl: string, openBook = true): string => {
     const normalizedUrl = normalizeBookUrl(bookUrl);
@@ -364,6 +1027,8 @@ function App() {
     setBookInfo(null);
     setProgress(null);
     setAreLocationsReady(false);
+    lastLocationRef.current = null;
+    stopSpeech();
     container.replaceChildren();
 
     if (renditionRef.current) {
@@ -457,7 +1122,17 @@ function App() {
     };
 
     rendition.on("relocated", (location: Location) => {
+      lastLocationRef.current = location;
       saveReadingLocation(location);
+
+      if (speechShouldContinueRef.current && !window.speechSynthesis.paused) {
+        const pageKey = getLocationSpeechKey(location);
+        if (pageKey && pageKey !== speechPageKeyRef.current) {
+          speechPageAdvanceTimerRef.current = window.setTimeout(() => {
+            startSpeechForCurrentPage();
+          }, 120);
+        }
+      }
     });
 
     Promise.allSettled([book.loaded.metadata, book.ready]).then(([metadataResult]) => {
@@ -508,9 +1183,11 @@ function App() {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "ArrowLeft") {
+        resetSpeechForManualPageChange();
         rendition.prev();
       }
       if (event.key === "ArrowRight") {
+        resetSpeechForManualPageChange();
         rendition.next();
       }
     };
@@ -519,6 +1196,7 @@ function App() {
 
     return () => {
       cancelled = true;
+      stopSpeech();
       window.removeEventListener("keydown", handleKeyDown);
       rendition.destroy();
       book.destroy();
@@ -557,8 +1235,14 @@ function App() {
     }
   };
 
-  const goToPreviousPage = () => renditionRef.current?.prev();
-  const goToNextPage = () => renditionRef.current?.next();
+  const goToPreviousPage = () => {
+    resetSpeechForManualPageChange();
+    renditionRef.current?.prev();
+  };
+  const goToNextPage = () => {
+    resetSpeechForManualPageChange();
+    renditionRef.current?.next();
+  };
 
   const updateFontSize = (delta: number) => {
     setSettings((currentSettings) => ({
@@ -583,6 +1267,14 @@ function App() {
         : null)
     : null;
   const formattedProgress = formatProgress(currentProgress);
+  const isSpeechActive = speechMode === "playing";
+  const speechButtonTitle =
+    speechMode === "unsupported"
+      ? "Read aloud is not supported in this browser"
+      : speechMode === "playing"
+        ? `Pause read aloud${speechLanguage ? ` (${speechLanguage})` : ""}`
+        : `Read this page aloud${speechLanguage ? ` (${speechLanguage})` : ""}`;
+  const isSpeechButtonDisabled = !activeBook || readerStatus !== "ready" || speechMode === "unsupported";
 
   return (
     <main className={`app theme-${settings.theme}`}>
@@ -612,6 +1304,16 @@ function App() {
         </div>
 
         <div className="toolbar-actions" aria-label="Reader controls">
+          <button
+            type="button"
+            className={`icon-button speech-button ${isSpeechActive ? "active" : ""}`}
+            onClick={() => void toggleSpeech()}
+            title={speechButtonTitle}
+            aria-label={speechButtonTitle}
+            disabled={isSpeechButtonDisabled}
+          >
+            {speechMode === "playing" ? <Pause aria-hidden="true" size={19} /> : <Play aria-hidden="true" size={19} />}
+          </button>
           <button type="button" className="icon-button" onClick={() => setIsLibraryOpen(true)} title="Library">
             <Library aria-hidden="true" size={19} />
           </button>
