@@ -16,6 +16,12 @@ body,
   width: 100%;
   height: 100%;
   margin: 0;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-text-size-adjust: 100%;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
 }
 
 button,
@@ -194,10 +200,11 @@ button {
 }
 
 .control-group {
-  height: 40px;
-  padding: 0 5px;
+  height: 38px;
+  padding: 0 3px;
   border: 1px solid var(--line);
   border-radius: 8px;
+  gap: 3px;
 }
 
 .icon-button {
@@ -248,11 +255,45 @@ button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  min-width: 74px;
+  min-width: 42px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 750;
   white-space: nowrap;
+}
+
+.page-control {
+  display: grid;
+  grid-template-columns: auto minmax(112px, 16vw);
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  min-width: 168px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.page-count {
+  min-width: 44px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.page-slider {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.page-slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .reader-shell {
@@ -277,6 +318,8 @@ button {
 .viewer {
   width: 100%;
   height: 100%;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .viewer iframe {
@@ -295,6 +338,8 @@ button {
   color: transparent;
   cursor: default;
   outline: 0;
+  touch-action: manipulation;
+  user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -533,8 +578,13 @@ button {
   }
 
   .control-group {
-    flex: 1 1 174px;
+    flex: 0 0 auto;
     justify-content: space-between;
+  }
+
+  .page-control {
+    grid-template-columns: auto minmax(120px, 1fr);
+    flex: 1 1 100%;
   }
 
   .page-zone-left {

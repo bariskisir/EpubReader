@@ -16,7 +16,6 @@ import {
   Plus,
   Sun,
   Trash2,
-  Type,
   X
 } from "lucide-react";
 import "./styles.css";
@@ -83,6 +82,8 @@ interface BookInfo {
 interface ReaderProgress {
   href: string;
   percentage: number | null;
+  page: number | null;
+  totalPages: number | null;
 }
 
 type PersistentState<T> = [T, Dispatch<SetStateAction<T>>];
@@ -202,7 +203,7 @@ function toDisplayPercentage(value: number | string | null | undefined): number 
 
 function formatProgress(value: number | string | null | undefined): string {
   const percentage = toDisplayPercentage(value);
-  if (percentage == null || percentage < 1) {
+  if (percentage == null) {
     return "";
   }
 
@@ -228,10 +229,45 @@ function getDisplayedPagePercentage(book: Book, location: Location): number | nu
   return toDisplayPercentage(((sectionIndex + sectionProgress) / spineLength) * 100);
 }
 
+function getReadingPercentage(book: Book, location: Location): number | null {
+  const cfi = location?.start?.cfi;
+  const generatedLocationCount = book.locations?.length?.() || 0;
+
+  if (cfi && generatedLocationCount > 0) {
+    return toDisplayPercentage(book.locations.percentageFromCfi(cfi) * 100);
+  }
+
+  return getDisplayedPagePercentage(book, location);
+}
+
+function getReadingPageInfo(
+  book: Book,
+  location: Location,
+  percentage: number | null
+): { page: number | null; totalPages: number | null } {
+  const generatedLocationCount = book.locations?.length?.() || 0;
+
+  if (generatedLocationCount > 0) {
+    if (location?.atEnd) {
+      return { page: generatedLocationCount, totalPages: generatedLocationCount };
+    }
+
+    const normalizedPercentage = Math.min(100, Math.max(0, percentage ?? 0));
+    const page = Math.floor((normalizedPercentage / 100) * generatedLocationCount) + 1;
+    return { page: Math.min(generatedLocationCount, Math.max(1, page)), totalPages: generatedLocationCount };
+  }
+
+  return {
+    page: location?.start?.displayed?.page || null,
+    totalPages: location?.start?.displayed?.total || null
+  };
+}
+
 function applyContentStyles(contents: Contents, settings: ReaderSettings): void {
   const colors = readerThemeColors[settings.theme] || readerThemeColors.light;
   const documentElement = contents.document?.documentElement;
   const body = contents.document?.body;
+  const preventDefault = (event: Event) => event.preventDefault();
 
   contents.css("font-size", `${settings.fontSize}%`, true);
   contents.css("font-family", "Georgia, Cambria, 'Times New Roman', serif", true);
@@ -239,20 +275,45 @@ function applyContentStyles(contents: Contents, settings: ReaderSettings): void 
   contents.css("color", colors.text, true);
   contents.css("background", colors.background, true);
   contents.css("background-color", colors.background, true);
+  contents.css("user-select", "none", true);
+  contents.css("-webkit-user-select", "none", true);
+  contents.css("-webkit-touch-callout", "none", true);
 
   if (documentElement) {
     documentElement.style.setProperty("background", colors.background, "important");
     documentElement.style.setProperty("color", colors.text, "important");
+    documentElement.style.setProperty("user-select", "none", "important");
+    documentElement.style.setProperty("-webkit-user-select", "none", "important");
+    documentElement.style.setProperty("-webkit-touch-callout", "none", "important");
   }
 
   if (body) {
     body.style.setProperty("background", colors.background, "important");
     body.style.setProperty("color", colors.text, "important");
+    body.style.setProperty("user-select", "none", "important");
+    body.style.setProperty("-webkit-user-select", "none", "important");
+    body.style.setProperty("-webkit-touch-callout", "none", "important");
   }
 
   contents.document?.querySelectorAll?.("a").forEach((link) => {
     link.style.setProperty("color", colors.link, "important");
   });
+
+  if (contents.document?.documentElement && !contents.document.documentElement.dataset.readerInputGuards) {
+    contents.document.documentElement.dataset.readerInputGuards = "true";
+    contents.document.addEventListener("selectstart", preventDefault);
+    contents.document.addEventListener("gesturestart", preventDefault);
+    contents.document.addEventListener("gesturechange", preventDefault);
+    contents.window?.addEventListener(
+      "wheel",
+      (event) => {
+        if (event.ctrlKey) {
+          event.preventDefault();
+        }
+      },
+      { passive: false }
+    );
+  }
 }
 
 function getRenditionContents(rendition: Rendition): Contents[] {
@@ -445,7 +506,7 @@ function createVisibleSpeechSnapshot(rendition: Rendition, location: Location | 
   };
 }
 
-async function sampleSpeechTextFromFollowingPages(
+async function sampleSpeechTextFromPages(
   bookUrl: string,
   startCfi: string | undefined,
   viewerElement: HTMLElement | null,
@@ -666,6 +727,10 @@ function App() {
   const speechTokenRef = useRef(0);
   const speechPageAdvanceTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<ScreenWakeLockSentinel | null>(null);
+  const languageDetectionTokenRef = useRef(0);
+  const pageHoldTimerRef = useRef<number | null>(null);
+  const pageHoldIntervalRef = useRef<number | null>(null);
+  const pageHoldDidRepeatRef = useRef(false);
 
   const activeBook = useMemo(
     () => library.find((book) => book.id === activeBookId) || null,
@@ -679,6 +744,36 @@ function App() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  useEffect(() => {
+    const preventZoomKeys = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) {
+        return;
+      }
+
+      if (["+", "=", "-", "_", "0"].includes(event.key)) {
+        event.preventDefault();
+      }
+    };
+    const preventWheelZoom = (event: WheelEvent) => {
+      if (event.ctrlKey) {
+        event.preventDefault();
+      }
+    };
+    const preventGesture = (event: Event) => event.preventDefault();
+
+    window.addEventListener("keydown", preventZoomKeys);
+    window.addEventListener("wheel", preventWheelZoom, { passive: false });
+    document.addEventListener("gesturestart", preventGesture);
+    document.addEventListener("gesturechange", preventGesture);
+
+    return () => {
+      window.removeEventListener("keydown", preventZoomKeys);
+      window.removeEventListener("wheel", preventWheelZoom);
+      document.removeEventListener("gesturestart", preventGesture);
+      document.removeEventListener("gesturechange", preventGesture);
+    };
+  }, []);
 
   function clearSpeechPageAdvanceTimer(): void {
     if (speechPageAdvanceTimerRef.current == null) {
@@ -757,6 +852,51 @@ function App() {
 
   function getCurrentSpeechLocation(): Location | null {
     return lastLocationRef.current || renditionRef.current?.location || null;
+  }
+
+  async function detectSpeechLanguageFromBookStart(bookUrl: string): Promise<void> {
+    const token = languageDetectionTokenRef.current + 1;
+    languageDetectionTokenRef.current = token;
+
+    try {
+      const currentLocation = getCurrentSpeechLocation();
+      const currentSnapshot = renditionRef.current
+        ? createVisibleSpeechSnapshot(renditionRef.current, currentLocation)
+        : { text: "", languageHint: "", pageKey: "" };
+      const sample = await sampleSpeechTextFromPages(bookUrl, undefined, viewerRef.current, settingsRef.current);
+      const language = detectLanguageFromText(
+        sample.text || currentSnapshot.text,
+        sample.languageHint || currentSnapshot.languageHint
+      );
+      const voices = isSpeechSupported() ? await getSpeechVoices() : [];
+
+      if (languageDetectionTokenRef.current !== token || activeBookRef.current?.url !== bookUrl) {
+        return;
+      }
+
+      speechLanguageRef.current = language;
+      speechVoiceRef.current = selectVoiceForLanguage(language, voices);
+      setSpeechLanguage(language);
+    } catch {
+      if (languageDetectionTokenRef.current !== token || activeBookRef.current?.url !== bookUrl) {
+        return;
+      }
+
+      const currentLocation = getCurrentSpeechLocation();
+      const snapshot = renditionRef.current
+        ? createVisibleSpeechSnapshot(renditionRef.current, currentLocation)
+        : { text: "", languageHint: "", pageKey: "" };
+      const fallbackLanguage = detectLanguageFromText(snapshot.text, snapshot.languageHint);
+      const voices = isSpeechSupported() ? await getSpeechVoices() : [];
+
+      if (languageDetectionTokenRef.current !== token || activeBookRef.current?.url !== bookUrl) {
+        return;
+      }
+
+      speechLanguageRef.current = fallbackLanguage;
+      speechVoiceRef.current = selectVoiceForLanguage(fallbackLanguage, voices);
+      setSpeechLanguage(fallbackLanguage);
+    }
   }
 
   function speakSpeechChunks(startIndex = 0): void {
@@ -909,7 +1049,7 @@ function App() {
       return;
     }
 
-    const initialLanguage = detectLanguageFromText(currentSnapshot.text, currentSnapshot.languageHint);
+    const initialLanguage = speechLanguageRef.current || detectLanguageFromText(currentSnapshot.text, currentSnapshot.languageHint);
     const currentPageKey = currentSnapshot.pageKey;
 
     speechLanguageRef.current = initialLanguage;
@@ -919,40 +1059,6 @@ function App() {
     speechChunkIndexRef.current = 0;
     speechPageKeyRef.current = currentPageKey;
     speakSpeechChunks(0);
-
-    try {
-      const sample = await sampleSpeechTextFromFollowingPages(
-        activeBookForSpeech.url,
-        currentLocation?.start?.cfi || activeBookForSpeech.position?.cfi,
-        viewerRef.current,
-        settingsRef.current
-      );
-      const language = detectLanguageFromText(
-        sample.text || currentSnapshot.text,
-        sample.languageHint || currentSnapshot.languageHint
-      );
-      const voices = await getSpeechVoices();
-      const voice = selectVoiceForLanguage(language, voices);
-
-      if (!speechShouldContinueRef.current || speechPageKeyRef.current !== currentPageKey) {
-        return;
-      }
-
-      speechLanguageRef.current = language;
-      speechVoiceRef.current = voice;
-      setSpeechLanguage(language);
-    } catch {
-      const fallbackLanguage = detectLanguageFromText(currentSnapshot.text, currentSnapshot.languageHint);
-      const voices = await getSpeechVoices();
-
-      if (!speechShouldContinueRef.current || speechPageKeyRef.current !== currentPageKey) {
-        return;
-      }
-
-      speechLanguageRef.current = fallbackLanguage;
-      speechVoiceRef.current = selectVoiceForLanguage(fallbackLanguage, voices);
-      setSpeechLanguage(fallbackLanguage);
-    }
   }
 
   const upsertBook = useCallback((bookUrl: string, openBook = true): string => {
@@ -1027,6 +1133,10 @@ function App() {
     setBookInfo(null);
     setProgress(null);
     setAreLocationsReady(false);
+    setSpeechLanguage("");
+    speechLanguageRef.current = "";
+    speechVoiceRef.current = null;
+    languageDetectionTokenRef.current += 1;
     lastLocationRef.current = null;
     stopSpeech();
     container.replaceChildren();
@@ -1096,7 +1206,8 @@ function App() {
       }
 
       const href = location?.start?.href || "";
-      const percentage = getDisplayedPagePercentage(book, location);
+      const percentage = getReadingPercentage(book, location);
+      const pageInfo = getReadingPageInfo(book, location, percentage);
       const currentBookId = activeBookRef.current.id;
 
       setLibrary((currentLibrary) =>
@@ -1118,7 +1229,7 @@ function App() {
         )
       );
 
-      setProgress({ href, percentage: percentage ?? null });
+      setProgress({ href, percentage: percentage ?? null, page: pageInfo.page, totalPages: pageInfo.totalPages });
     };
 
     rendition.on("relocated", (location: Location) => {
@@ -1157,7 +1268,15 @@ function App() {
     });
 
     book.ready
-      .then(() => {
+      .then(async () => {
+        if (!cancelled) {
+          try {
+            await book.locations.generate(1000);
+          } catch {
+            // Displayed page data is still available if generated locations fail.
+          }
+        }
+
         if (!cancelled) {
           setAreLocationsReady(true);
           rendition.reportLocation();
@@ -1170,6 +1289,7 @@ function App() {
       .then(() => {
         if (!cancelled) {
           setReaderStatus("ready");
+          void detectSpeechLanguageFromBookStart(activeBook.url);
         }
       })
       .catch(() => {
@@ -1196,6 +1316,8 @@ function App() {
 
     return () => {
       cancelled = true;
+      languageDetectionTokenRef.current += 1;
+      clearPageHoldNavigation();
       stopSpeech();
       window.removeEventListener("keydown", handleKeyDown);
       rendition.destroy();
@@ -1244,6 +1366,63 @@ function App() {
     renditionRef.current?.next();
   };
 
+  function clearPageHoldNavigation(): void {
+    if (pageHoldTimerRef.current != null) {
+      window.clearTimeout(pageHoldTimerRef.current);
+      pageHoldTimerRef.current = null;
+    }
+
+    if (pageHoldIntervalRef.current != null) {
+      window.clearInterval(pageHoldIntervalRef.current);
+      pageHoldIntervalRef.current = null;
+    }
+  }
+
+  function startPageHoldNavigation(direction: "previous" | "next"): void {
+    clearPageHoldNavigation();
+    pageHoldDidRepeatRef.current = false;
+    pageHoldTimerRef.current = window.setTimeout(() => {
+      pageHoldDidRepeatRef.current = true;
+      const turnPage = direction === "previous" ? goToPreviousPage : goToNextPage;
+      turnPage();
+      pageHoldIntervalRef.current = window.setInterval(turnPage, 90);
+    }, 260);
+  }
+
+  function finishPageHoldNavigation(): void {
+    clearPageHoldNavigation();
+  }
+
+  function clickPageZone(direction: "previous" | "next"): void {
+    if (pageHoldDidRepeatRef.current) {
+      pageHoldDidRepeatRef.current = false;
+      return;
+    }
+
+    if (direction === "previous") {
+      goToPreviousPage();
+      return;
+    }
+
+    goToNextPage();
+  }
+
+  const goToProgress = (nextProgress: number) => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition || readerStatus !== "ready") {
+      return;
+    }
+
+    const clampedProgress = Math.min(100, Math.max(0, nextProgress));
+    const generatedLocationCount = book.locations?.length?.() || 0;
+    resetSpeechForManualPageChange();
+
+    if (generatedLocationCount > 0) {
+      rendition.display(book.locations.cfiFromPercentage(clampedProgress / 100));
+    }
+  };
+
   const updateFontSize = (delta: number) => {
     setSettings((currentSettings) => ({
       ...currentSettings,
@@ -1267,6 +1446,13 @@ function App() {
         : null)
     : null;
   const formattedProgress = formatProgress(currentProgress);
+  const pageLabel =
+    progress?.page && progress.totalPages
+      ? `${progress.page}/${progress.totalPages}`
+      : progress?.page
+        ? `${progress.page}`
+        : "0/0";
+  const sliderValue = Math.round((currentProgress ?? 0) * 10);
   const isSpeechActive = speechMode === "playing";
   const speechButtonTitle =
     speechMode === "unsupported"
@@ -1275,6 +1461,10 @@ function App() {
         ? `Pause read aloud${speechLanguage ? ` (${speechLanguage})` : ""}`
         : `Read this page aloud${speechLanguage ? ` (${speechLanguage})` : ""}`;
   const isSpeechButtonDisabled = !activeBook || readerStatus !== "ready" || speechMode === "unsupported";
+
+  useEffect(() => {
+    document.title = formattedProgress ? `${formattedProgress} - ${readerTitle}` : readerTitle;
+  }, [formattedProgress, readerTitle]);
 
   return (
     <main className={`app theme-${settings.theme}`}>
@@ -1324,13 +1514,24 @@ function App() {
             <button type="button" className="icon-button" onClick={() => updateFontSize(-5)} title="Smaller text">
               <Minus aria-hidden="true" size={18} />
             </button>
-            <span className="font-indicator">
-              <Type aria-hidden="true" size={16} />
-              {settings.fontSize}%
-            </span>
+            <span className="font-indicator">{settings.fontSize}%</span>
             <button type="button" className="icon-button" onClick={() => updateFontSize(5)} title="Larger text">
               <Plus aria-hidden="true" size={18} />
             </button>
+          </div>
+          <div className="page-control" aria-label="Page navigation">
+            <span className="page-count">{pageLabel}</span>
+            <input
+              className="page-slider"
+              type="range"
+              min="0"
+              max="1000"
+              step="1"
+              value={sliderValue}
+              onChange={(event) => goToProgress(Number(event.currentTarget.value) / 10)}
+              disabled={!activeBook || readerStatus !== "ready" || !areLocationsReady}
+              aria-label="Reading progress"
+            />
           </div>
           <button type="button" className="icon-button" onClick={toggleTheme} title="Toggle theme">
             {settings.theme === "light" ? <Moon aria-hidden="true" size={19} /> : <Sun aria-hidden="true" size={19} />}
@@ -1353,8 +1554,26 @@ function App() {
           <div ref={viewerRef} className="viewer" />
         </div>
 
-        <button type="button" className="page-zone page-zone-left" onClick={goToPreviousPage} aria-label="Previous page" />
-        <button type="button" className="page-zone page-zone-right" onClick={goToNextPage} aria-label="Next page" />
+        <button
+          type="button"
+          className="page-zone page-zone-left"
+          onClick={() => clickPageZone("previous")}
+          onPointerDown={() => startPageHoldNavigation("previous")}
+          onPointerUp={finishPageHoldNavigation}
+          onPointerCancel={finishPageHoldNavigation}
+          onPointerLeave={finishPageHoldNavigation}
+          aria-label="Previous page"
+        />
+        <button
+          type="button"
+          className="page-zone page-zone-right"
+          onClick={() => clickPageZone("next")}
+          onPointerDown={() => startPageHoldNavigation("next")}
+          onPointerUp={finishPageHoldNavigation}
+          onPointerCancel={finishPageHoldNavigation}
+          onPointerLeave={finishPageHoldNavigation}
+          aria-label="Next page"
+        />
       </section>
 
       {isLibraryOpen && (
