@@ -247,7 +247,41 @@ button {
   background: #1f8a4c;
 }
 
-.language-select {
+.speech-button.loading {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.speech-loading-icon {
+  animation: speech-loading-spin 800ms linear infinite;
+}
+
+@keyframes speech-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.speech-error {
+  position: fixed;
+  z-index: 29;
+  right: 16px;
+  bottom: 16px;
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  background: var(--panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.2);
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.provider-select,
+.language-select,
+.model-select {
   width: 108px;
   height: 38px;
   flex: 0 0 auto;
@@ -260,8 +294,20 @@ button {
   font-weight: 750;
 }
 
+.provider-select {
+  width: 116px;
+}
+
+.model-select {
+  width: 124px;
+}
+
+.provider-select:hover,
+.provider-select:focus,
 .language-select:hover,
-.language-select:focus {
+.language-select:focus,
+.model-select:hover,
+.model-select:focus {
   border-color: var(--accent);
   outline: 0;
 }
@@ -345,6 +391,18 @@ button {
 .viewer iframe {
   border: 0;
   outline: 0;
+}
+
+.deepgram-cache-viewer {
+  position: fixed;
+  z-index: -1;
+  top: 0;
+  left: -200vw;
+  width: 100vw;
+  height: 100dvh;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .page-zone {
@@ -575,7 +633,7 @@ button {
     align-items: stretch;
     flex-direction: column;
     gap: 12px;
-    padding: 58px 10px 10px;
+    padding: 36px 10px 10px;
   }
 
   .floating-menu-button {

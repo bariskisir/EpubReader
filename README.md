@@ -18,9 +18,7 @@ The app also accepts `book` and `epub` as query parameter names:
 
 If no query parameter is provided, use the plus button to add an EPUB URL. Opening the same EPUB URL again reuses the existing saved book instead of adding a duplicate.
 
-Use the play button in the top menu to listen to the current page with the browser Web Speech API. The reader detects the book language from the current page and nearby pages, supports Turkish and English language selection, pauses playback, and automatically advances to the next page when the current page finishes.
-
-Speech playback depends on the browser and operating system voices installed on the device. Mobile browsers may stop Web Speech playback when the app is backgrounded or the screen is locked; the app requests Screen Wake Lock where supported to reduce interruptions while the reader stays open.
+Use the play button in the top menu to listen to the current page. Deepgram is the default text-to-speech provider, with English and the Thalia Aura-2 voice selected by default. The provider dropdown can switch playback to the browser Web Speech API. When Deepgram is selected, the language and model dropdowns let you choose any supported Aura-2 language and voice. The reader pauses playback and automatically advances to the next page when the current page finishes.
 
 GitHub `blob` and `raw` links are normalized automatically. For example, this:
 
