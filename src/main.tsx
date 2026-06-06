@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type Dispatch,
+  type FormEvent,
+  type SetStateAction
+} from "react";
 import { createRoot } from "react-dom/client";
 import ePub from "epubjs";
 import type Book from "epubjs/types/book";
@@ -17,15 +27,19 @@ import {
   Plus,
   Sun,
   Trash2,
+  Upload,
   X
 } from "lucide-react";
 import "./styles.css";
 
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
+const UPLOADED_BOOK_DB_NAME = "epub-reader:uploaded-books:v1";
+const UPLOADED_BOOK_STORE_NAME = "files";
 const READER_SENTENCE_CLASS = "reader-sentence";
 const SENTENCE_BLOCK_SELECTOR = "p, li, blockquote, figcaption, dd, dt, td, th, h1, h2, h3, h4, h5, h6";
 const MAX_SPEECH_CHUNK_LENGTH = 900;
+const EPUB_OPEN_TIMEOUT_MS = 20000;
 const DEEPGRAM_CACHED_PAGE_COUNT = 3;
 const DEEPGRAM_PROGRESSIVE_SENTENCE_COUNT = 100;
 const DEEPGRAM_PROGRESSIVE_GROUP_SIZES = [1, 1, 1, 2, 2, 2] as const;
@@ -160,6 +174,7 @@ const readerThemeColors = {
 
 type Theme = keyof typeof readerThemeColors;
 type SpeechProvider = "deepgram" | "web-speech";
+type BookSource = "url" | "file";
 
 type ReaderStatus = "idle" | "loading" | "ready" | "error";
 type SpeechMode = "idle" | "loading" | "playing" | "paused" | "unsupported" | "error";
@@ -184,6 +199,10 @@ interface ReadingPosition {
 interface LibraryBook {
   id: string;
   url: string;
+  source?: BookSource;
+  fileStorageKey?: string;
+  fileName?: string;
+  fileSize?: number;
   title: string;
   author: string;
   addedAt: string;
@@ -245,6 +264,10 @@ interface BrowserWithScreenWakeLock {
   };
 }
 
+interface ResolvedBookSource {
+  input: string | ArrayBuffer;
+}
+
 function hashText(text: string): string {
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
@@ -265,6 +288,90 @@ function readJson<T>(key: string, fallback: T): T {
 
 function writeJson<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value));
+}
+
+function openUploadedBookDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(UPLOADED_BOOK_DB_NAME, 1);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(UPLOADED_BOOK_STORE_NAME)) {
+        db.createObjectStore(UPLOADED_BOOK_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Uploaded EPUB storage could not be opened."));
+    request.onblocked = () => reject(new Error("Uploaded EPUB storage is blocked by another tab."));
+  });
+}
+
+async function saveUploadedBookBlob(storageKey: string, blob: Blob): Promise<void> {
+  const db = await openUploadedBookDb();
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(UPLOADED_BOOK_STORE_NAME, "readwrite");
+    transaction.objectStore(UPLOADED_BOOK_STORE_NAME).put(blob, storageKey);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error || new Error("Uploaded EPUB could not be saved."));
+    };
+    transaction.onabort = () => {
+      db.close();
+      reject(transaction.error || new Error("Uploaded EPUB save was aborted."));
+    };
+  });
+}
+
+async function getUploadedBookBlob(storageKey: string): Promise<Blob | null> {
+  const db = await openUploadedBookDb();
+
+  return new Promise((resolve, reject) => {
+    let uploadedBlob: Blob | null = null;
+    const transaction = db.transaction(UPLOADED_BOOK_STORE_NAME, "readonly");
+    const request = transaction.objectStore(UPLOADED_BOOK_STORE_NAME).get(storageKey) as IDBRequest<Blob | undefined>;
+
+    request.onsuccess = () => {
+      uploadedBlob = request.result instanceof Blob ? request.result : null;
+    };
+    transaction.oncomplete = () => {
+      db.close();
+      resolve(uploadedBlob);
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error || new Error("Uploaded EPUB could not be read."));
+    };
+    transaction.onabort = () => {
+      db.close();
+      reject(transaction.error || new Error("Uploaded EPUB read was aborted."));
+    };
+  });
+}
+
+async function deleteUploadedBookBlob(storageKey: string): Promise<void> {
+  const db = await openUploadedBookDb();
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(UPLOADED_BOOK_STORE_NAME, "readwrite");
+    transaction.objectStore(UPLOADED_BOOK_STORE_NAME).delete(storageKey);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error || new Error("Uploaded EPUB could not be deleted."));
+    };
+    transaction.onabort = () => {
+      db.close();
+      reject(transaction.error || new Error("Uploaded EPUB delete was aborted."));
+    };
+  });
 }
 
 function convertKnownHostedUrl(url: URL): URL {
@@ -297,7 +404,7 @@ function normalizeBookUrl(value: string): string {
 
 function getQueryBookUrl(): string {
   const params = new URLSearchParams(window.location.search);
-  const rawUrl = params.get("url") || params.get("book") || params.get("epub") || "";
+  const rawUrl = params.get("epub") || params.get("book") || params.get("url") || "";
 
   try {
     return rawUrl ? normalizeBookUrl(rawUrl) : "";
@@ -320,12 +427,78 @@ function createBook(url: string): LibraryBook {
   return {
     id: hashText(url),
     url,
+    source: "url",
     title: "",
     author: "",
     addedAt: now,
     updatedAt: now,
     position: null
   };
+}
+
+function createUploadedBook(file: File, storageKey: string): LibraryBook {
+  const now = new Date().toISOString();
+  const title = file.name.replace(/\.epub$/i, "") || "Uploaded EPUB";
+
+  return {
+    id: hashText(`file:${storageKey}`),
+    url: file.name,
+    source: "file",
+    fileStorageKey: storageKey,
+    fileName: file.name,
+    fileSize: file.size,
+    title,
+    author: "",
+    addedAt: now,
+    updatedAt: now,
+    position: null
+  };
+}
+
+function getBookSource(book: LibraryBook): BookSource {
+  return book.source || "url";
+}
+
+function getBookDescription(book: LibraryBook): string {
+  return getBookSource(book) === "file" ? book.fileName || book.url || "Uploaded EPUB" : book.url;
+}
+
+async function resolveBookSource(book: LibraryBook): Promise<ResolvedBookSource> {
+  if (getBookSource(book) !== "file") {
+    return { input: book.url };
+  }
+
+  if (!book.fileStorageKey) {
+    throw new Error("Uploaded EPUB file reference is missing.");
+  }
+
+  const blob = await getUploadedBookBlob(book.fileStorageKey);
+  if (!blob) {
+    throw new Error("Uploaded EPUB file is missing from browser storage.");
+  }
+
+  return { input: await blob.arrayBuffer() };
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+
+    promise
+      .then(resolve)
+      .catch(reject)
+      .finally(() => window.clearTimeout(timeoutId));
+  });
+}
+
+function createEpubBook(input: string | ArrayBuffer): { book: Book; openPromise: Promise<object> } {
+  const book = ePub();
+
+  if (typeof input === "string") {
+    return { book, openPromise: book.open(input) };
+  }
+
+  return { book, openPromise: book.open(input.slice(0), "binary") };
 }
 
 function toDisplayPercentage(value: number | string | null | undefined): number | null {
@@ -957,6 +1130,8 @@ function App() {
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isAddOpen, setIsAddOpen] = useState(!queryBookUrl);
   const [urlInput, setUrlInput] = useState("");
+  const [addDialogError, setAddDialogError] = useState("");
+  const [isUploadingBook, setIsUploadingBook] = useState(false);
   const [readerError, setReaderError] = useState("");
   const [speechError, setSpeechError] = useState("");
   const [readerStatus, setReaderStatus] = useState<ReaderStatus>("idle");
@@ -967,12 +1142,14 @@ function App() {
   const [progress, setProgress] = useState<ReaderProgress | null>(null);
   const [areLocationsReady, setAreLocationsReady] = useState(false);
   const viewerRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const bookRef = useRef<Book | null>(null);
   const renditionRef = useRef<Rendition | null>(null);
   const deepgramCacheBookRef = useRef<Book | null>(null);
   const deepgramCacheRenditionRef = useRef<Rendition | null>(null);
   const deepgramCacheContainerRef = useRef<HTMLDivElement | null>(null);
   const activeBookRef = useRef<LibraryBook | null>(null);
+  const pendingAddedBookIdsRef = useRef<Set<string>>(new Set());
   const settingsRef = useRef(settings);
   const queryBookHandledRef = useRef(false);
   const lastLocationRef = useRef<Location | null>(null);
@@ -1767,6 +1944,9 @@ function App() {
         );
       }
 
+      if (openBook) {
+        pendingAddedBookIdsRef.current.add(existingId);
+      }
       return [createBook(normalizedUrl), ...currentLibrary];
     });
 
@@ -1779,13 +1959,73 @@ function App() {
     return existingId;
   }, [setLibrary]);
 
+  const upsertUploadedBook = useCallback(async (file: File, openBook = true): Promise<string> => {
+    const storageKey = `upload-${hashText(`${file.name}:${file.size}:${file.lastModified}`)}`;
+    const uploadedBook = createUploadedBook(file, storageKey);
+
+    await saveUploadedBookBlob(storageKey, file);
+
+    setLibrary((currentLibrary) => {
+      const existingBook = currentLibrary.find((book) => book.id === uploadedBook.id);
+      if (existingBook) {
+        return currentLibrary.map((book) =>
+          book.id === uploadedBook.id
+            ? {
+                ...book,
+                url: uploadedBook.url,
+                source: "file",
+                fileStorageKey: storageKey,
+                fileName: file.name,
+                fileSize: file.size,
+                updatedAt: new Date().toISOString()
+              }
+            : book
+        );
+      }
+
+      if (openBook) {
+        pendingAddedBookIdsRef.current.add(uploadedBook.id);
+      }
+      return [uploadedBook, ...currentLibrary];
+    });
+
+    if (openBook) {
+      setActiveBookId(uploadedBook.id);
+      setIsAddOpen(false);
+      setIsLibraryOpen(false);
+    }
+
+    return uploadedBook.id;
+  }, [setLibrary]);
+
+  const openAddDialog = () => {
+    setAddDialogError("");
+    setIsAddOpen(true);
+  };
+
+  const removePendingAddedBook = useCallback((book: LibraryBook): void => {
+    if (!pendingAddedBookIdsRef.current.has(book.id)) {
+      return;
+    }
+
+    pendingAddedBookIdsRef.current.delete(book.id);
+    if (book.source === "file" && book.fileStorageKey) {
+      void deleteUploadedBookBlob(book.fileStorageKey);
+    }
+
+    setLibrary((currentLibrary) => currentLibrary.filter((storedBook) => storedBook.id !== book.id));
+    setActiveBookId((currentBookId) => (currentBookId === book.id ? null : currentBookId));
+    setBookInfo(null);
+    setProgress(null);
+  }, [setLibrary]);
+
   useEffect(() => {
     if (queryBookUrl && !queryBookHandledRef.current) {
       queryBookHandledRef.current = true;
       try {
         upsertBook(queryBookUrl, true);
       } catch {
-        setReaderError("The URL query parameter is not a valid EPUB URL.");
+        setReaderError("The epub query string is not a valid EPUB URL.");
       }
       return;
     }
@@ -1818,7 +2058,17 @@ function App() {
   }, [settings]);
 
   useEffect(() => {
-    if (!activeBook || !viewerRef.current || !deepgramCacheContainerRef.current) {
+    if (!activeBook) {
+      setBookInfo(null);
+      setProgress(null);
+      setAreLocationsReady(false);
+      lastLocationRef.current = null;
+      viewerRef.current?.replaceChildren();
+      deepgramCacheContainerRef.current?.replaceChildren();
+      return undefined;
+    }
+
+    if (!viewerRef.current || !deepgramCacheContainerRef.current) {
       return undefined;
     }
 
@@ -1856,207 +2106,281 @@ function App() {
       deepgramCacheBookRef.current = null;
     }
 
-    const book = ePub(activeBook.url);
-    bookRef.current = book;
-    const cacheBook = ePub(activeBook.url);
-    deepgramCacheBookRef.current = cacheBook;
+    let openedBook: Book | null = null;
+    let openedCacheBook: Book | null = null;
+    let openedRendition: Rendition | null = null;
+    let openedCacheRendition: Rendition | null = null;
+    let handleKeyDown: ((event: KeyboardEvent) => void) | null = null;
+    let openFailed = false;
 
-    const rendition = book.renderTo(container, {
-      width: "100%",
-      height: "100%",
-      ignoreClass: READER_SENTENCE_CLASS,
-      flow: "paginated",
-      spread: "auto",
-      minSpreadWidth: 900
-    });
-
-    renditionRef.current = rendition;
-    rendition.hooks.content.register((contents: Contents) => {
-      applyContentStyles(contents, settingsRef.current);
-    });
-    const cacheRendition = cacheBook.renderTo(cacheContainer, {
-      width: "100%",
-      height: "100%",
-      ignoreClass: READER_SENTENCE_CLASS,
-      flow: "paginated",
-      spread: "auto",
-      minSpreadWidth: 900
-    });
-    deepgramCacheRenditionRef.current = cacheRendition;
-    cacheRendition.hooks.content.register((contents: Contents) => {
-      applyContentStyles(contents, settingsRef.current);
-    });
-    cacheRendition.themes.fontSize(`${settingsRef.current.fontSize}%`);
-
-    rendition.themes.register("light", {
-      html: {
-        background: readerThemeColors.light.background,
-        color: readerThemeColors.light.text
-      },
-      body: {
-        background: readerThemeColors.light.background,
-        color: readerThemeColors.light.text,
-        "font-family": "Georgia, Cambria, 'Times New Roman', serif",
-        "line-height": "1.65"
-      },
-      a: { color: readerThemeColors.light.link }
-    });
-    rendition.themes.register("dark", {
-      html: {
-        background: readerThemeColors.dark.background,
-        color: readerThemeColors.dark.text
-      },
-      body: {
-        background: readerThemeColors.dark.background,
-        color: readerThemeColors.dark.text,
-        "font-family": "Georgia, Cambria, 'Times New Roman', serif",
-        "line-height": "1.65"
-      },
-      a: { color: readerThemeColors.dark.link }
-    });
-    applyReaderPreferences(rendition, settingsRef.current);
-
-    const saveReadingLocation = (location: Location) => {
-      if (!activeBookRef.current) {
-        return;
-      }
-
-      const cfi = location?.start?.cfi;
-      if (!cfi) {
-        return;
-      }
-
-      const href = location?.start?.href || "";
-      const percentage = getReadingPercentage(book, location);
-      const pageInfo = getReadingPageInfo(book, location, percentage);
-      const currentBookId = activeBookRef.current.id;
-
-      setLibrary((currentLibrary) =>
-        currentLibrary.map((storedBook) =>
-          storedBook.id === currentBookId
-            ? {
-                ...storedBook,
-                updatedAt: new Date().toISOString(),
-                position: {
-                  cfi,
-                  href,
-                  percentage,
-                  isPrecise: percentage != null,
-                  progressMethod: PROGRESS_METHOD,
-                  updatedAt: new Date().toISOString()
-                }
-              }
-            : storedBook
-        )
-      );
-
-      setProgress({ href, percentage: percentage ?? null, page: pageInfo.page, totalPages: pageInfo.totalPages });
-    };
-
-    rendition.on("relocated", (location: Location) => {
-      lastLocationRef.current = location;
-      saveReadingLocation(location);
-    });
-
-    Promise.allSettled([book.loaded.metadata, book.ready]).then(([metadataResult]) => {
+    const failOpen = (message = "This EPUB could not be opened. Check that the file or URL is valid and reachable.") => {
       if (cancelled) {
         return;
       }
 
-      if (metadataResult.status === "fulfilled") {
-        const metadata = metadataResult.value || {};
-        const title = metadata.title || activeBook.title || "Untitled EPUB";
-        const author = formatAuthor(metadata.creator) || activeBook.author;
-        setBookInfo({ title, author });
-
-        setLibrary((currentLibrary) =>
-          currentLibrary.map((storedBook) =>
-            storedBook.id === activeBook.id
-              ? { ...storedBook, title, author, updatedAt: new Date().toISOString() }
-              : storedBook
-          )
-        );
-      }
-    });
-
-    book.ready
-      .then(async () => {
-        if (!cancelled) {
-          try {
-            await book.locations.generate(1000);
-          } catch {
-            // Displayed page data is still available if generated locations fail.
-          }
-        }
-
-        if (!cancelled) {
-          setAreLocationsReady(true);
-          rendition.reportLocation();
-        }
-      })
-      .catch(() => undefined);
-
-    rendition
-      .display(activeBook.position?.cfi || undefined)
-      .then(() => {
-        if (!cancelled) {
-          setReaderStatus("ready");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setReaderStatus("error");
-          setReaderError(
-            "This EPUB could not be opened. Check that the URL is reachable and allows browser CORS requests."
-          );
-        }
-      });
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "ArrowLeft") {
-        resetSpeechForManualPageChange();
-        rendition.prev();
-      }
-      if (event.key === "ArrowRight") {
-        resetSpeechForManualPageChange();
-        rendition.next();
-      }
+      openFailed = true;
+      removePendingAddedBook(activeBook);
+      setReaderStatus("error");
+      setReaderError(message);
     };
 
-    window.addEventListener("keydown", handleKeyDown);
+    void (async () => {
+      try {
+        const source = await resolveBookSource(activeBook);
+        if (cancelled) {
+          return;
+        }
+
+        const primaryBook = createEpubBook(source.input);
+        const cacheBook = createEpubBook(source.input);
+        openedBook = primaryBook.book;
+        bookRef.current = openedBook;
+        openedCacheBook = cacheBook.book;
+        deepgramCacheBookRef.current = openedCacheBook;
+
+        await withTimeout(
+          Promise.all([primaryBook.openPromise, cacheBook.openPromise]),
+          EPUB_OPEN_TIMEOUT_MS,
+          "EPUB opening timed out."
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        openedRendition = openedBook.renderTo(container, {
+          width: "100%",
+          height: "100%",
+          ignoreClass: READER_SENTENCE_CLASS,
+          flow: "paginated",
+          spread: "auto",
+          minSpreadWidth: 900
+        });
+
+        renditionRef.current = openedRendition;
+        openedRendition.hooks.content.register((contents: Contents) => {
+          applyContentStyles(contents, settingsRef.current);
+        });
+        openedCacheRendition = openedCacheBook.renderTo(cacheContainer, {
+          width: "100%",
+          height: "100%",
+          ignoreClass: READER_SENTENCE_CLASS,
+          flow: "paginated",
+          spread: "auto",
+          minSpreadWidth: 900
+        });
+        deepgramCacheRenditionRef.current = openedCacheRendition;
+        openedCacheRendition.hooks.content.register((contents: Contents) => {
+          applyContentStyles(contents, settingsRef.current);
+        });
+        openedCacheRendition.themes.fontSize(`${settingsRef.current.fontSize}%`);
+
+        openedRendition.themes.register("light", {
+          html: {
+            background: readerThemeColors.light.background,
+            color: readerThemeColors.light.text
+          },
+          body: {
+            background: readerThemeColors.light.background,
+            color: readerThemeColors.light.text,
+            "font-family": "Georgia, Cambria, 'Times New Roman', serif",
+            "line-height": "1.65"
+          },
+          a: { color: readerThemeColors.light.link }
+        });
+        openedRendition.themes.register("dark", {
+          html: {
+            background: readerThemeColors.dark.background,
+            color: readerThemeColors.dark.text
+          },
+          body: {
+            background: readerThemeColors.dark.background,
+            color: readerThemeColors.dark.text,
+            "font-family": "Georgia, Cambria, 'Times New Roman', serif",
+            "line-height": "1.65"
+          },
+          a: { color: readerThemeColors.dark.link }
+        });
+        applyReaderPreferences(openedRendition, settingsRef.current);
+
+        const saveReadingLocation = (location: Location) => {
+          if (!activeBookRef.current || !openedBook) {
+            return;
+          }
+
+          const cfi = location?.start?.cfi;
+          if (!cfi) {
+            return;
+          }
+
+          const href = location?.start?.href || "";
+          const percentage = getReadingPercentage(openedBook, location);
+          const pageInfo = getReadingPageInfo(openedBook, location, percentage);
+          const currentBookId = activeBookRef.current.id;
+
+          setLibrary((currentLibrary) =>
+            currentLibrary.map((storedBook) =>
+              storedBook.id === currentBookId
+                ? {
+                    ...storedBook,
+                    updatedAt: new Date().toISOString(),
+                    position: {
+                      cfi,
+                      href,
+                      percentage,
+                      isPrecise: percentage != null,
+                      progressMethod: PROGRESS_METHOD,
+                      updatedAt: new Date().toISOString()
+                    }
+                  }
+                : storedBook
+            )
+          );
+
+          setProgress({ href, percentage: percentage ?? null, page: pageInfo.page, totalPages: pageInfo.totalPages });
+        };
+
+        openedRendition.on("relocated", (location: Location) => {
+          lastLocationRef.current = location;
+          saveReadingLocation(location);
+        });
+
+        Promise.allSettled([openedBook.loaded.metadata, openedBook.ready]).then(([metadataResult]) => {
+          if (cancelled || openFailed) {
+            return;
+          }
+
+          if (metadataResult.status === "fulfilled") {
+            const metadata = metadataResult.value || {};
+            const title = metadata.title || activeBook.title || "Untitled EPUB";
+            const author = formatAuthor(metadata.creator) || activeBook.author;
+            setBookInfo({ title, author });
+
+            setLibrary((currentLibrary) =>
+              currentLibrary.map((storedBook) =>
+                storedBook.id === activeBook.id
+                  ? { ...storedBook, title, author, updatedAt: new Date().toISOString() }
+                  : storedBook
+              )
+            );
+          }
+        });
+
+        openedBook.ready
+          .then(async () => {
+            if (!cancelled && !openFailed && openedBook) {
+              try {
+                await openedBook.locations.generate(1000);
+              } catch {
+                // Displayed page data is still available if generated locations fail.
+              }
+            }
+
+            if (!cancelled && !openFailed && openedRendition) {
+              setAreLocationsReady(true);
+              openedRendition.reportLocation();
+            }
+          })
+          .catch(() => {
+            failOpen("This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
+          });
+
+        withTimeout(
+          openedRendition.display(activeBook.position?.cfi || undefined),
+          EPUB_OPEN_TIMEOUT_MS,
+          "EPUB opening timed out."
+        )
+          .then(() => {
+            if (!cancelled && !openFailed) {
+              pendingAddedBookIdsRef.current.delete(activeBook.id);
+              setReaderStatus("ready");
+            }
+          })
+          .catch(() => {
+            failOpen("This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
+          });
+
+        handleKeyDown = (event: KeyboardEvent) => {
+          if (!openedRendition) {
+            return;
+          }
+
+          if (event.key === "ArrowLeft") {
+            resetSpeechForManualPageChange();
+            openedRendition.prev();
+          }
+          if (event.key === "ArrowRight") {
+            resetSpeechForManualPageChange();
+            openedRendition.next();
+          }
+        };
+
+        window.addEventListener("keydown", handleKeyDown);
+      } catch {
+        failOpen("This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
+      }
+    })();
 
     return () => {
       cancelled = true;
       clearPageHoldNavigation();
       stopSpeech();
-      window.removeEventListener("keydown", handleKeyDown);
-      rendition.destroy();
-      book.destroy();
-      cacheRendition.destroy();
-      cacheBook.destroy();
-      if (renditionRef.current === rendition) {
+      if (handleKeyDown) {
+        window.removeEventListener("keydown", handleKeyDown);
+      }
+      openedRendition?.destroy();
+      openedBook?.destroy();
+      openedCacheRendition?.destroy();
+      openedCacheBook?.destroy();
+      if (renditionRef.current === openedRendition) {
         renditionRef.current = null;
       }
-      if (bookRef.current === book) {
+      if (bookRef.current === openedBook) {
         bookRef.current = null;
       }
-      if (deepgramCacheRenditionRef.current === cacheRendition) {
+      if (deepgramCacheRenditionRef.current === openedCacheRendition) {
         deepgramCacheRenditionRef.current = null;
       }
-      if (deepgramCacheBookRef.current === cacheBook) {
+      if (deepgramCacheBookRef.current === openedCacheBook) {
         deepgramCacheBookRef.current = null;
       }
     };
-  }, [activeBook?.id]);
+  }, [activeBook?.id, removePendingAddedBook]);
 
   const addBookFromInput = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     try {
+      setAddDialogError("");
       upsertBook(urlInput, true);
       setUrlInput("");
     } catch {
-      setReaderError("Enter a valid absolute or relative EPUB URL.");
+      setAddDialogError("Enter a valid absolute or relative EPUB URL.");
+    }
+  };
+
+  const addBookFromFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0] || null;
+    event.currentTarget.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (!file.name.toLowerCase().endsWith(".epub") && file.type !== "application/epub+zip") {
+      setAddDialogError("Choose a .epub file.");
+      return;
+    }
+
+    setIsUploadingBook(true);
+    setAddDialogError("");
+    try {
+      await upsertUploadedBook(file, true);
+      setUrlInput("");
+    } catch {
+      setAddDialogError("This EPUB could not be saved in the browser.");
+    } finally {
+      setIsUploadingBook(false);
     }
   };
 
@@ -2067,11 +2391,22 @@ function App() {
   };
 
   const removeBook = (bookId: string) => {
+    const removedBook = library.find((book) => book.id === bookId);
+    if (removedBook?.source === "file" && removedBook.fileStorageKey) {
+      void deleteUploadedBookBlob(removedBook.fileStorageKey);
+    }
+
     setLibrary((currentLibrary) => currentLibrary.filter((book) => book.id !== bookId));
     if (activeBookId === bookId) {
       const nextBook = library.find((book) => book.id !== bookId);
       setActiveBookId(nextBook?.id ?? null);
       setIsAddOpen(!nextBook);
+      if (!nextBook) {
+        setBookInfo(null);
+        setProgress(null);
+        setReaderStatus("idle");
+        setReaderError("");
+      }
     }
   };
 
@@ -2286,7 +2621,7 @@ function App() {
               <h1>{readerTitle}</h1>
               {formattedProgress && <span className="progress-pill">{formattedProgress}</span>}
             </div>
-            <p>{readerAuthor || activeBook?.url || "Add an EPUB URL to start reading"}</p>
+            <p>{readerAuthor || (activeBook ? getBookDescription(activeBook) : "Add an EPUB URL to start reading")}</p>
           </div>
         </div>
 
@@ -2310,7 +2645,7 @@ function App() {
           <button type="button" className="icon-button" onClick={() => setIsLibraryOpen(true)} title="Library">
             <Library aria-hidden="true" size={19} />
           </button>
-          <button type="button" className="icon-button" onClick={() => setIsAddOpen(true)} title="Add EPUB">
+          <button type="button" className="icon-button" onClick={openAddDialog} title="Add EPUB">
             <Plus aria-hidden="true" size={20} />
           </button>
           <select
@@ -2395,8 +2730,8 @@ function App() {
             <div className="empty-state">
               <BookOpen aria-hidden="true" size={44} />
               <h2>No EPUB selected</h2>
-              <p>Use the plus button to add a book URL, or open this page with a URL query parameter.</p>
-              <code>?url=https://example.com/book.epub</code>
+              <p>Use the plus button to add a book, upload an EPUB file, or open this page with an epub query string.</p>
+              <code>?epub=https://example.com/book.epub</code>
             </div>
           )}
           {readerStatus === "loading" && activeBook && <div className="loading-state">Opening EPUB...</div>}
@@ -2431,9 +2766,14 @@ function App() {
         <aside className="drawer" aria-label="Saved books">
           <div className="drawer-header">
             <h2>Library</h2>
-            <button type="button" className="icon-button" onClick={() => setIsLibraryOpen(false)} title="Close library">
-              <X aria-hidden="true" size={19} />
-            </button>
+            <div className="drawer-actions">
+              <button type="button" className="icon-button" onClick={openAddDialog} title="Add EPUB">
+                <Plus aria-hidden="true" size={20} />
+              </button>
+              <button type="button" className="icon-button" onClick={() => setIsLibraryOpen(false)} title="Close library">
+                <X aria-hidden="true" size={19} />
+              </button>
+            </div>
           </div>
 
           <div className="book-list">
@@ -2442,7 +2782,7 @@ function App() {
               <article className={`book-card ${book.id === activeBookId ? "active" : ""}`} key={book.id}>
                 <button type="button" className="book-open-button" onClick={() => openBook(book.id)}>
                   <span>{book.title || "Untitled EPUB"}</span>
-                  <small>{book.author || book.url}</small>
+                  <small>{book.author || getBookDescription(book)}</small>
                   {formatProgress(
                     book.id === activeBookId
                       ? areLocationsReady
@@ -2489,6 +2829,11 @@ function App() {
                 <X aria-hidden="true" size={19} />
               </button>
             </div>
+            {addDialogError && (
+              <div className="dialog-error" role="alert">
+                {addDialogError}
+              </div>
+            )}
             <label htmlFor="book-url">EPUB URL</label>
             <input
               id="book-url"
@@ -2502,6 +2847,28 @@ function App() {
             <button type="submit" className="primary-button">
               Add and open
             </button>
+            <div className="dialog-divider" aria-hidden="true">
+              <span />
+              <strong>or</strong>
+              <span />
+            </div>
+            <label className={`upload-button ${isUploadingBook ? "disabled" : ""}`} htmlFor="book-file">
+              {isUploadingBook ? (
+                <LoaderCircle aria-hidden="true" className="speech-loading-icon" size={18} />
+              ) : (
+                <Upload aria-hidden="true" size={18} />
+              )}
+              <span>{isUploadingBook ? "Saving EPUB..." : "Upload EPUB file"}</span>
+            </label>
+            <input
+              ref={fileInputRef}
+              id="book-file"
+              className="file-input"
+              type="file"
+              accept=".epub,application/epub+zip"
+              onChange={(event) => void addBookFromFile(event)}
+              disabled={isUploadingBook}
+            />
           </form>
         </div>
       )}

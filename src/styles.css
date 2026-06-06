@@ -513,6 +513,12 @@ button {
   letter-spacing: 0;
 }
 
+.drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .book-list {
   min-height: 0;
   overflow: auto;
@@ -612,6 +618,18 @@ button {
   color: var(--text);
 }
 
+.dialog-error {
+  margin: 14px 16px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
 .primary-button {
   width: calc(100% - 32px);
   height: 44px;
@@ -621,6 +639,55 @@ button {
   background: var(--accent);
   color: #fffaf3;
   font-weight: 800;
+}
+
+.dialog-divider {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin: 0 16px 16px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.dialog-divider span {
+  height: 1px;
+  background: var(--line);
+}
+
+.add-dialog .upload-button {
+  width: calc(100% - 32px);
+  min-height: 44px;
+  margin: 0 16px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: #fffaf3;
+  background: var(--accent);
+  cursor: pointer;
+  font-weight: 800;
+  font-size: inherit;
+}
+
+.add-dialog .upload-button:hover {
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+  color: #fffaf3;
+}
+
+.add-dialog .upload-button.disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.file-input {
+  display: none;
 }
 
 @media (max-width: 760px) {
