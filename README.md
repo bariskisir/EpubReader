@@ -7,7 +7,7 @@ A simple full-screen client-side EPUB reader for Vercel. The app opens EPUBs fro
 Open a book directly with the `epub` query string:
 
 
-https://epub-reader-omega.vercel.app?epub=https://github.com/bariskisir/AI-Books/raw/refs/heads/master/books/The_Meridian_Cycle/epub/Book_0_The_Gate_at_Kestrel_Falling.epub
+https://epub-reader-omega.vercel.app?epub=https://github.com/bariskisir/AI-Books/raw/refs/heads/master/series/The_Meridian_Cycle/epub/Book_0_The_Gate_at_Kestrel_Falling.epub
 
 The app also accepts `book` and `url` as legacy query parameter aliases:
 
