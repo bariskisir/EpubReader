@@ -36,10 +36,9 @@ const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
 const UPLOADED_BOOK_DB_NAME = "epub-reader:uploaded-books:v1";
 const UPLOADED_BOOK_STORE_NAME = "files";
-const READER_SENTENCE_CLASS = "reader-sentence";
-const SENTENCE_BLOCK_SELECTOR = "p, li, blockquote, figcaption, dd, dt, td, th, h1, h2, h3, h4, h5, h6";
 const MAX_SPEECH_CHUNK_LENGTH = 900;
 const EPUB_OPEN_TIMEOUT_MS = 20000;
+const SPEECH_PAGE_TURN_TIMEOUT_MS = 2500;
 const DEEPGRAM_CACHED_PAGE_COUNT = 3;
 const DEEPGRAM_PROGRESSIVE_SENTENCE_COUNT = 100;
 const DEEPGRAM_PROGRESSIVE_GROUP_SIZES = [1, 1, 1, 2, 2, 2] as const;
@@ -572,105 +571,6 @@ function getReadingPageInfo(
   };
 }
 
-function getSentenceRanges(text: string): Array<{ start: number; end: number }> {
-  const ranges: Array<{ start: number; end: number }> = [];
-  const sentencePattern = /[^.!?\u3002\uff01\uff1f]+(?:[.!?\u3002\uff01\uff1f]+["'\u201d\u2019\u00bb)\]]*|$)\s*/g;
-  let match = sentencePattern.exec(text);
-
-  while (match) {
-    if (match[0].trim()) {
-      ranges.push({ start: match.index, end: match.index + match[0].length });
-    }
-    match = sentencePattern.exec(text);
-  }
-
-  return ranges;
-}
-
-function wrapBlockSentences(block: Element): void {
-  if (
-    block.hasAttribute("data-reader-sentences") ||
-    block.closest(`.${READER_SENTENCE_CLASS}`) ||
-    block.querySelector(SENTENCE_BLOCK_SELECTOR)
-  ) {
-    return;
-  }
-
-  const document = block.ownerDocument;
-  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      return isReadableTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
-    }
-  });
-  const textNodes: Array<{ node: Text; start: number; end: number }> = [];
-  let text = "";
-  let currentNode = walker.nextNode() as Text | null;
-
-  while (currentNode) {
-    const start = text.length;
-    text += currentNode.data;
-    textNodes.push({ node: currentNode, start, end: text.length });
-    currentNode = walker.nextNode() as Text | null;
-  }
-
-  const sentenceRanges = getSentenceRanges(text);
-  for (let index = sentenceRanges.length - 1; index >= 0; index -= 1) {
-    const sentence = sentenceRanges[index];
-    const startEntry = textNodes.find((entry) => sentence.start >= entry.start && sentence.start < entry.end);
-    const endEntry = [...textNodes].reverse().find((entry) => sentence.end > entry.start && sentence.end <= entry.end);
-    if (!startEntry || !endEntry) {
-      continue;
-    }
-
-    const range = document.createRange();
-    try {
-      range.setStart(startEntry.node, sentence.start - startEntry.start);
-      range.setEnd(endEntry.node, sentence.end - endEntry.start);
-      const wrapper = document.createElement("span");
-      wrapper.className = READER_SENTENCE_CLASS;
-      wrapper.append(range.extractContents());
-      range.insertNode(wrapper);
-    } catch {
-      // Some malformed EPUB markup cannot be safely wrapped.
-    } finally {
-      range.detach();
-    }
-  }
-
-  block.setAttribute("data-reader-sentences", "true");
-}
-
-function preventSentencePageSplits(document: Document): void {
-  document.querySelectorAll(SENTENCE_BLOCK_SELECTOR).forEach(wrapBlockSentences);
-}
-
-function allowOversizedSentencesToSplit(contents: Contents): void {
-  const document = contents.document;
-  const view = contents.window;
-  if (!document || !view) {
-    return;
-  }
-
-  view.requestAnimationFrame(() => {
-    const viewportHeight = view.innerHeight || document.documentElement.clientHeight;
-    if (!viewportHeight) {
-      return;
-    }
-
-    document.querySelectorAll(`.${READER_SENTENCE_CLASS}`).forEach((sentence) => {
-      const element = sentence as HTMLElement;
-      if (element.getBoundingClientRect().height <= viewportHeight * 0.9) {
-        return;
-      }
-
-      element.style.setProperty("display", "inline", "important");
-      element.style.setProperty("break-inside", "auto", "important");
-      element.style.setProperty("page-break-inside", "auto", "important");
-      element.style.setProperty("-webkit-column-break-inside", "auto", "important");
-    });
-  });
-}
-
 function applyContentStyles(contents: Contents, settings: ReaderSettings): void {
   const colors = readerThemeColors[settings.theme] || readerThemeColors.light;
   const documentElement = contents.document?.documentElement;
@@ -701,18 +601,6 @@ function applyContentStyles(contents: Contents, settings: ReaderSettings): void 
     body.style.setProperty("-webkit-user-select", "none", "important");
     body.style.setProperty("-webkit-touch-callout", "none", "important");
   }
-
-  preventSentencePageSplits(contents.document);
-  contents.document?.querySelectorAll?.(`.${READER_SENTENCE_CLASS}`).forEach((sentence: Element) => {
-    const element = sentence as HTMLElement;
-    element.style.setProperty("display", "inline-block", "important");
-    element.style.setProperty("max-width", "100%", "important");
-    element.style.setProperty("break-inside", "avoid", "important");
-    element.style.setProperty("page-break-inside", "avoid", "important");
-    element.style.setProperty("-webkit-column-break-inside", "avoid", "important");
-    element.style.setProperty("vertical-align", "baseline", "important");
-  });
-  allowOversizedSentencesToSplit(contents);
 
   contents.document?.querySelectorAll?.("a").forEach((link) => {
     link.style.setProperty("color", colors.link, "important");
@@ -893,21 +781,6 @@ function getElementFromNode(node: Node): Element | null {
   return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
 }
 
-function getSentenceAtRangeBoundary(container: Node, offset: number, edge: "start" | "end"): Element | null {
-  const closestSentence = getElementFromNode(container)?.closest(`.${READER_SENTENCE_CLASS}`);
-  if (closestSentence) {
-    return closestSentence;
-  }
-
-  if (container.nodeType !== Node.ELEMENT_NODE) {
-    return null;
-  }
-
-  const childIndex = edge === "end" ? offset - 1 : offset;
-  const child = container.childNodes.item(childIndex);
-  return child ? getElementFromNode(child)?.closest(`.${READER_SENTENCE_CLASS}`) || null : null;
-}
-
 function extractLocationSpeechText(rendition: Rendition, location: Location | null): { text: string; languageHint: string } {
   const startCfi = location?.start?.cfi;
   const endCfi = location?.end?.cfi;
@@ -929,11 +802,6 @@ function extractLocationSpeechText(rendition: Rendition, location: Location | nu
     try {
       pageRange.setStart(startRange.startContainer, startRange.startOffset);
       pageRange.setEnd(endRange.endContainer, endRange.endOffset);
-
-      const endSentence = getSentenceAtRangeBoundary(endRange.endContainer, endRange.endOffset, "end");
-      if (endSentence) {
-        pageRange.setEndAfter(endSentence);
-      }
     } catch {
       pageRange.detach();
       return { text: "", languageHint: "" };
@@ -1163,8 +1031,8 @@ function App() {
   const speechShouldContinueRef = useRef(false);
   const speechPausedRef = useRef(false);
   const speechTokenRef = useRef(0);
-  const speechPageAdvanceTimerRef = useRef<number | null>(null);
   const speechPageAdvanceInFlightRef = useRef(false);
+  const speechPageTurnCleanupRef = useRef<(() => void) | null>(null);
   const deepgramAudioRef = useRef<HTMLAudioElement | null>(null);
   const deepgramAudioUrlsRef = useRef<Set<string>>(new Set());
   const deepgramAudioCacheRef = useRef<Map<string, Promise<string>>>(new Map());
@@ -1182,6 +1050,10 @@ function App() {
   const pageHoldTimerRef = useRef<number | null>(null);
   const pageHoldIntervalRef = useRef<number | null>(null);
   const pageHoldDidRepeatRef = useRef(false);
+  const manualPageNavigationInFlightRef = useRef(false);
+  const pageNavigationOriginRef = useRef<"speech" | "manual" | null>(null);
+  const pendingManualPageDirectionRef = useRef<"previous" | "next" | null>(null);
+  const manualPageNavigationGenerationRef = useRef(0);
 
   const activeBook = useMemo(
     () => library.find((book) => book.id === activeBookId) || null,
@@ -1259,13 +1131,9 @@ function App() {
     };
   }, []);
 
-  function clearSpeechPageAdvanceTimer(): void {
-    if (speechPageAdvanceTimerRef.current == null) {
-      return;
-    }
-
-    window.clearTimeout(speechPageAdvanceTimerRef.current);
-    speechPageAdvanceTimerRef.current = null;
+  function clearSpeechPageTurnWait(): void {
+    speechPageTurnCleanupRef.current?.();
+    speechPageTurnCleanupRef.current = null;
   }
 
   async function releaseSpeechWakeLock(): Promise<void> {
@@ -1487,8 +1355,9 @@ function App() {
       groupIndex: 0,
       complete: false
     };
-    speechPageAdvanceInFlightRef.current = false;
-    clearSpeechPageAdvanceTimer();
+    if (!speechPageAdvanceInFlightRef.current) {
+      clearSpeechPageTurnWait();
+    }
     clearDeepgramPlayback();
 
     if (isWebSpeechSupported()) {
@@ -1521,51 +1390,115 @@ function App() {
   }
 
   function getCurrentSpeechLocation(): Location | null {
-    return renditionRef.current?.location || lastLocationRef.current || null;
+    return lastLocationRef.current || renditionRef.current?.location || null;
+  }
+
+  function moveToNextSpeechPage(rendition: Rendition, previousPageKey: string): Promise<Location | null> {
+    clearSpeechPageTurnWait();
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutId: number | null = null;
+
+      const cleanup = () => {
+        if (timeoutId != null) {
+          window.clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        rendition.off("relocated", handleRelocated);
+        if (speechPageTurnCleanupRef.current === cleanup) {
+          speechPageTurnCleanupRef.current = null;
+        }
+      };
+      const finish = (location: Location | null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(location);
+      };
+      const fail = (error: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const hasPageChanged = (location: Location | null) =>
+        Boolean(location && (location.atEnd || getLocationSpeechKey(location) !== previousPageKey));
+      const handleRelocated = (location: Location) => {
+        if (hasPageChanged(location)) {
+          finish(location);
+        }
+      };
+
+      speechPageTurnCleanupRef.current = cleanup;
+      rendition.on("relocated", handleRelocated);
+      timeoutId = window.setTimeout(() => {
+        const location = lastLocationRef.current || rendition.location || null;
+        finish(hasPageChanged(location) ? location : null);
+      }, SPEECH_PAGE_TURN_TIMEOUT_MS);
+
+      rendition
+        .next()
+        .then(() => {
+          const location = lastLocationRef.current || rendition.location || null;
+          if (hasPageChanged(location)) {
+            finish(location);
+          }
+        })
+        .catch(fail);
+    });
   }
 
   function advanceAfterSpeechPage(): void {
     const rendition = renditionRef.current;
     const currentLocation = getCurrentSpeechLocation();
-    const completedDeepgramPage = deepgramCachePagesRef.current.get(speechPageKeyRef.current);
+    const completedPageKey = speechPageKeyRef.current;
+    const completedDeepgramPage = deepgramCachePagesRef.current.get(completedPageKey);
     if (speechProviderRef.current === "deepgram" && completedDeepgramPage) {
       deepgramProgressiveStateRef.current = completedDeepgramPage.nextProgressiveState;
     }
-    deepgramCachePagesRef.current.delete(speechPageKeyRef.current);
+    deepgramCachePagesRef.current.delete(completedPageKey);
     if (!rendition || currentLocation?.atEnd) {
       stopSpeech("idle");
       return;
     }
 
-    if (speechPageAdvanceInFlightRef.current) {
+    if (speechPageAdvanceInFlightRef.current || manualPageNavigationInFlightRef.current) {
       return;
     }
 
     const token = speechTokenRef.current;
+    const navigationGeneration = manualPageNavigationGenerationRef.current;
     speechPageAdvanceInFlightRef.current = true;
-    clearSpeechPageAdvanceTimer();
+    manualPageNavigationInFlightRef.current = true;
+    pageNavigationOriginRef.current = "speech";
+    clearSpeechPageTurnWait();
 
-    void rendition
-      .next()
-      .then(() => {
+    void moveToNextSpeechPage(rendition, completedPageKey)
+      .then((location) => {
+        speechPageAdvanceInFlightRef.current = false;
+        finishPageNavigation(rendition, navigationGeneration);
         if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
-          speechPageAdvanceInFlightRef.current = false;
           return;
         }
 
-        speechPageAdvanceTimerRef.current = window.setTimeout(() => {
-          speechPageAdvanceTimerRef.current = null;
-          if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
-            speechPageAdvanceInFlightRef.current = false;
-            return;
+        if (!location || getLocationSpeechKey(location) === completedPageKey) {
+          if (!location?.atEnd) {
+            setSpeechError("The next EPUB page could not be loaded.");
           }
+          stopSpeech(location?.atEnd ? "idle" : "error");
+          return;
+        }
 
-          speechPageAdvanceInFlightRef.current = false;
-          startSpeechForCurrentPage();
-        }, 120);
+        startSpeechForCurrentPage(location, completedPageKey);
       })
       .catch((error) => {
         speechPageAdvanceInFlightRef.current = false;
+        finishPageNavigation(rendition, navigationGeneration);
         if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
           return;
         }
@@ -1590,7 +1523,7 @@ function App() {
     const token = speechTokenRef.current + 1;
     speechTokenRef.current = token;
     speechChunkIndexRef.current = startIndex;
-    clearSpeechPageAdvanceTimer();
+    clearSpeechPageTurnWait();
     void requestSpeechWakeLock();
 
     const speakAt = (index: number) => {
@@ -1707,7 +1640,7 @@ function App() {
     const token = speechTokenRef.current + 1;
     speechTokenRef.current = token;
     speechChunkIndexRef.current = startIndex;
-    clearSpeechPageAdvanceTimer();
+    clearSpeechPageTurnWait();
     void requestSpeechWakeLock();
     const pageKey = speechPageKeyRef.current;
     const currentPage = deepgramCachePagesRef.current.get(pageKey);
@@ -1803,17 +1736,26 @@ function App() {
     speakWebSpeechChunks(startIndex);
   }
 
-  function startSpeechForCurrentPage(): void {
+  function startSpeechForCurrentPage(
+    location: Location | null = getCurrentSpeechLocation(),
+    previousPageKey = ""
+  ): void {
     const rendition = renditionRef.current;
     if (!rendition) {
       stopSpeech("idle");
       return;
     }
 
-    const currentLocation = getCurrentSpeechLocation();
-    const snapshot = createVisibleSpeechSnapshot(rendition, currentLocation);
+    const snapshot = createVisibleSpeechSnapshot(rendition, location);
+    if (previousPageKey && (!snapshot.pageKey || snapshot.pageKey === previousPageKey)) {
+      setSpeechError("The reader did not finish changing pages.");
+      stopSpeech("error");
+      return;
+    }
+
+    speechPageKeyRef.current = snapshot.pageKey;
     if (!snapshot.text) {
-      if (currentLocation?.atEnd) {
+      if (location?.atEnd) {
         stopSpeech("idle");
         return;
       }
@@ -1832,7 +1774,6 @@ function App() {
       speechChunksRef.current = splitSpeechText(snapshot.text);
     }
     speechChunkIndexRef.current = 0;
-    speechPageKeyRef.current = snapshot.pageKey;
     speakSpeechChunks(0);
   }
 
@@ -1868,12 +1809,7 @@ function App() {
         speechShouldContinueRef.current = true;
         speechPausedRef.current = false;
         window.speechSynthesis.resume();
-        window.speechSynthesis.cancel();
-        speechChunksRef.current = [];
-        speechChunkIndexRef.current = 0;
-        speechPageKeyRef.current = "";
         setSpeechMode("playing");
-        startSpeechForCurrentPage();
         void requestSpeechWakeLock();
         return;
       }
@@ -2085,6 +2021,10 @@ function App() {
     setAreLocationsReady(false);
     lastLocationRef.current = null;
     stopSpeech();
+    manualPageNavigationGenerationRef.current += 1;
+    manualPageNavigationInFlightRef.current = false;
+    pageNavigationOriginRef.current = null;
+    pendingManualPageDirectionRef.current = null;
     container.replaceChildren();
     cacheContainer.replaceChildren();
 
@@ -2151,7 +2091,6 @@ function App() {
         openedRendition = openedBook.renderTo(container, {
           width: "100%",
           height: "100%",
-          ignoreClass: READER_SENTENCE_CLASS,
           flow: "paginated",
           spread: "auto",
           minSpreadWidth: 900
@@ -2164,7 +2103,6 @@ function App() {
         openedCacheRendition = openedCacheBook.renderTo(cacheContainer, {
           width: "100%",
           height: "100%",
-          ignoreClass: READER_SENTENCE_CLASS,
           flow: "paginated",
           spread: "auto",
           minSpreadWidth: 900
@@ -2242,6 +2180,15 @@ function App() {
 
         openedRendition.on("relocated", (location: Location) => {
           lastLocationRef.current = location;
+          const relocatedPageKey = getLocationSpeechKey(location);
+          if (
+            speechShouldContinueRef.current &&
+            speechPageKeyRef.current &&
+            relocatedPageKey !== speechPageKeyRef.current &&
+            !speechPageAdvanceInFlightRef.current
+          ) {
+            stopSpeech();
+          }
           saveReadingLocation(location);
         });
 
@@ -2306,12 +2253,10 @@ function App() {
           }
 
           if (event.key === "ArrowLeft") {
-            resetSpeechForManualPageChange();
-            openedRendition.prev();
+            navigateManually("previous");
           }
           if (event.key === "ArrowRight") {
-            resetSpeechForManualPageChange();
-            openedRendition.next();
+            navigateManually("next");
           }
         };
 
@@ -2323,6 +2268,12 @@ function App() {
 
     return () => {
       cancelled = true;
+      manualPageNavigationGenerationRef.current += 1;
+      manualPageNavigationInFlightRef.current = false;
+      pageNavigationOriginRef.current = null;
+      pendingManualPageDirectionRef.current = null;
+      speechPageAdvanceInFlightRef.current = false;
+      clearSpeechPageTurnWait();
       clearPageHoldNavigation();
       stopSpeech();
       if (handleKeyDown) {
@@ -2410,14 +2361,109 @@ function App() {
     }
   };
 
-  const goToPreviousPage = () => {
+  function finishPageNavigation(rendition: Rendition, generation: number): void {
+    if (
+      generation !== manualPageNavigationGenerationRef.current ||
+      renditionRef.current !== rendition
+    ) {
+      return;
+    }
+
+    manualPageNavigationInFlightRef.current = false;
+    pageNavigationOriginRef.current = null;
+    const pendingDirection = pendingManualPageDirectionRef.current;
+    pendingManualPageDirectionRef.current = null;
+    if (pendingDirection) {
+      navigateManually(pendingDirection);
+    }
+  }
+
+  function moveManualPageAndWaitForRelocation(
+    rendition: Rendition,
+    direction: "previous" | "next"
+  ): Promise<void> {
+    const previousPageKey = getLocationSpeechKey(lastLocationRef.current || rendition.location || null);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutId: number | null = null;
+
+      const cleanup = () => {
+        if (timeoutId != null) {
+          window.clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        rendition.off("relocated", handleRelocated);
+      };
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const fail = (error: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const hasNavigationFinished = (location: Location | null) =>
+        Boolean(
+          location &&
+            (getLocationSpeechKey(location) !== previousPageKey ||
+              (direction === "next" ? location.atEnd : location.atStart))
+        );
+      const handleRelocated = (location: Location) => {
+        if (hasNavigationFinished(location)) {
+          finish();
+        }
+      };
+
+      rendition.on("relocated", handleRelocated);
+      timeoutId = window.setTimeout(finish, SPEECH_PAGE_TURN_TIMEOUT_MS);
+      const navigation = direction === "previous" ? rendition.prev() : rendition.next();
+      navigation
+        .then(() => {
+          if (hasNavigationFinished(lastLocationRef.current || rendition.location || null)) {
+            finish();
+          }
+        })
+        .catch(fail);
+    });
+  }
+
+  function navigateManually(direction: "previous" | "next"): void {
     resetSpeechForManualPageChange();
-    renditionRef.current?.prev();
-  };
-  const goToNextPage = () => {
-    resetSpeechForManualPageChange();
-    renditionRef.current?.next();
-  };
+    const rendition = renditionRef.current;
+    if (!rendition || !lastLocationRef.current) {
+      return;
+    }
+
+    if (manualPageNavigationInFlightRef.current) {
+      if (pageNavigationOriginRef.current !== "speech" || direction === "previous") {
+        pendingManualPageDirectionRef.current = direction;
+      }
+      return;
+    }
+
+    const generation = manualPageNavigationGenerationRef.current;
+    manualPageNavigationInFlightRef.current = true;
+    pageNavigationOriginRef.current = "manual";
+    void moveManualPageAndWaitForRelocation(rendition, direction)
+      .catch((error) => {
+        console.error("EPUB page navigation failed.", error);
+      })
+      .finally(() => {
+        finishPageNavigation(rendition, generation);
+      });
+  }
+
+  const goToPreviousPage = () => navigateManually("previous");
+  const goToNextPage = () => navigateManually("next");
 
   function clearPageHoldNavigation(): void {
     if (pageHoldTimerRef.current != null) {
