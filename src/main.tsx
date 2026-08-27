@@ -31,6 +31,7 @@ import {
   X
 } from "lucide-react";
 import "./styles.css";
+import { trackAppStartup } from "./telemetry";
 
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
@@ -1063,6 +1064,10 @@ function App() {
   useEffect(() => {
     activeBookRef.current = activeBook;
   }, [activeBook]);
+
+  useEffect(() => {
+    void trackAppStartup();
+  }, []);
 
   useEffect(() => {
     settingsRef.current = settings;
