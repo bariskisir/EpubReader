@@ -20,7 +20,7 @@
     "vite": "^8.0.16"
   },
   "overrides": {
-    "@xmldom/xmldom": "^0.9.10"
+    "@xmldom/xmldom": "^0.9.12"
   },
   "devDependencies": {
     "@types/react": "^18.3.29",
