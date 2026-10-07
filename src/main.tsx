@@ -32,6 +32,14 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { trackAppStartup } from "./telemetry";
+import {
+  DEFAULT_PIPER_VOICE,
+  PIPER_LANGUAGE_OPTIONS,
+  PIPER_VOICE_OPTIONS,
+  generatePiperWav,
+  isPiperSupported,
+  isPiperVoiceId
+} from "./piper";
 
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
@@ -53,7 +61,8 @@ const DEFAULT_SPEECH_LANGUAGE = "en-US";
 const DEFAULT_DEEPGRAM_MODEL = "aura-2-thalia-en";
 const SPEECH_PROVIDER_OPTIONS = [
   { value: "deepgram", label: "Deepgram" },
-  { value: "web-speech", label: "Web Speech" }
+  { value: "web-speech", label: "Web Speech" },
+  { value: "piper", label: "Piper (local)" }
 ] as const;
 const DEEPGRAM_LANGUAGE_OPTIONS = [
   { value: "en-US", label: "English" },
@@ -154,7 +163,8 @@ const defaultSettings: ReaderSettings = {
   theme: "dark",
   speechProvider: DEFAULT_SPEECH_PROVIDER,
   speechLanguage: DEFAULT_SPEECH_LANGUAGE,
-  deepgramModel: DEFAULT_DEEPGRAM_MODEL
+  deepgramModel: DEFAULT_DEEPGRAM_MODEL,
+  piperVoice: DEFAULT_PIPER_VOICE
 };
 
 const PROGRESS_METHOD = "displayed-pages-v1";
@@ -173,7 +183,7 @@ const readerThemeColors = {
 } as const;
 
 type Theme = keyof typeof readerThemeColors;
-type SpeechProvider = "deepgram" | "web-speech";
+type SpeechProvider = "deepgram" | "web-speech" | "piper";
 type BookSource = "url" | "file";
 
 type ReaderStatus = "idle" | "loading" | "ready" | "error";
@@ -185,6 +195,7 @@ interface ReaderSettings {
   speechProvider?: SpeechProvider;
   speechLanguage?: string;
   deepgramModel?: string;
+  piperVoice?: string;
 }
 
 interface ReadingPosition {
@@ -651,7 +662,17 @@ function isWebSpeechSupported(): boolean {
 }
 
 function isSpeechProviderSupported(provider: SpeechProvider): boolean {
+  if (provider === "piper") {
+    return isPiperSupported();
+  }
   return provider === "deepgram" || isWebSpeechSupported();
+}
+
+function getSpeechProviderLabel(provider: SpeechProvider): string {
+  if (provider === "piper") {
+    return "Piper";
+  }
+  return provider === "deepgram" ? "Deepgram" : "Web Speech API";
 }
 
 function getBaseLanguage(language: string): string {
@@ -1027,6 +1048,7 @@ function App() {
   const speechProviderRef = useRef<SpeechProvider>(settings.speechProvider || DEFAULT_SPEECH_PROVIDER);
   const speechLanguageRef = useRef(settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE);
   const deepgramModelRef = useRef(settings.deepgramModel || DEFAULT_DEEPGRAM_MODEL);
+  const piperVoiceRef = useRef(settings.piperVoice || DEFAULT_PIPER_VOICE);
   const speechVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const speechPageKeyRef = useRef("");
   const speechShouldContinueRef = useRef(false);
@@ -1035,6 +1057,10 @@ function App() {
   const speechPageAdvanceInFlightRef = useRef(false);
   const speechPageTurnCleanupRef = useRef<(() => void) | null>(null);
   const deepgramAudioRef = useRef<HTMLAudioElement | null>(null);
+  const piperAudioRef = useRef<HTMLAudioElement | null>(null);
+  const piperAudioUrlsRef = useRef<Set<string>>(new Set());
+  const piperAudioCacheRef = useRef<Map<string, Promise<string>>>(new Map());
+  const piperGenerationRef = useRef(0);
   const deepgramAudioUrlsRef = useRef<Set<string>>(new Set());
   const deepgramAudioCacheRef = useRef<Map<string, Promise<string>>>(new Map());
   const deepgramCachePagesRef = useRef<Map<string, DeepgramCachedPage>>(new Map());
@@ -1074,15 +1100,21 @@ function App() {
     const nextProvider = settings.speechProvider || DEFAULT_SPEECH_PROVIDER;
     const storedLanguage = settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE;
     const nextLanguage =
-      nextProvider === "deepgram" && !isDeepgramLanguageSupported(storedLanguage)
-        ? DEFAULT_SPEECH_LANGUAGE
-        : storedLanguage;
+      nextProvider === "piper"
+        ? "tr-TR"
+        : nextProvider === "deepgram" && !isDeepgramLanguageSupported(storedLanguage)
+          ? DEFAULT_SPEECH_LANGUAGE
+          : storedLanguage;
     const nextDeepgramModel = isDeepgramModelForLanguage(settings.deepgramModel || "", nextLanguage)
       ? settings.deepgramModel || DEFAULT_DEEPGRAM_MODEL
       : getDefaultDeepgramModel(nextLanguage);
+    const nextPiperVoice = isPiperVoiceId(settings.piperVoice || "")
+      ? (settings.piperVoice as string)
+      : DEFAULT_PIPER_VOICE;
     speechProviderRef.current = nextProvider;
     speechLanguageRef.current = nextLanguage;
     deepgramModelRef.current = nextDeepgramModel;
+    piperVoiceRef.current = nextPiperVoice;
     if (isWebSpeechSupported()) {
       speechVoiceRef.current = selectVoiceForLanguage(nextLanguage, window.speechSynthesis.getVoices());
       void getSpeechVoices().then((voices) => {
@@ -1095,13 +1127,15 @@ function App() {
     if (
       settings.speechProvider !== nextProvider ||
       settings.speechLanguage !== nextLanguage ||
-      settings.deepgramModel !== nextDeepgramModel
+      settings.deepgramModel !== nextDeepgramModel ||
+      settings.piperVoice !== nextPiperVoice
     ) {
       setSettings((currentSettings) => ({
         ...currentSettings,
         speechProvider: nextProvider,
         speechLanguage: nextLanguage,
-        deepgramModel: nextDeepgramModel
+        deepgramModel: nextDeepgramModel,
+        piperVoice: nextPiperVoice
       }));
     }
   }, [settings]);
@@ -1342,6 +1376,93 @@ function App() {
     return audio;
   }
 
+  function getPiperAudioCacheKey(pageKey: string, chunkIndex: number): string {
+    return `${piperVoiceRef.current}\n${pageKey}\n${chunkIndex}`;
+  }
+
+  function getPiperAudioElement(): HTMLAudioElement {
+    const audio = piperAudioRef.current || document.createElement("audio");
+    piperAudioRef.current = audio;
+    audio.autoplay = true;
+    audio.controls = false;
+    audio.preload = "auto";
+    audio.setAttribute("playsinline", "");
+    audio.setAttribute("webkit-playsinline", "");
+    audio.setAttribute("aria-hidden", "true");
+    audio.style.position = "fixed";
+    audio.style.width = "1px";
+    audio.style.height = "1px";
+    audio.style.opacity = "0";
+    audio.style.pointerEvents = "none";
+    if (!audio.isConnected) {
+      document.body.appendChild(audio);
+    }
+    return audio;
+  }
+
+  function primePiperAudio(): HTMLAudioElement {
+    const audio = getPiperAudioElement();
+    audio.src = SILENT_AUDIO_URL;
+    audio.load();
+    void audio.play().catch(() => {
+      // The real playback attempt below will surface a useful browser error.
+    });
+    return audio;
+  }
+
+  function clearPiperPlayback(): void {
+    piperGenerationRef.current += 1;
+    piperAudioCacheRef.current.clear();
+    [...piperAudioUrlsRef.current].forEach((audioUrl) => {
+      URL.revokeObjectURL(audioUrl);
+      piperAudioUrlsRef.current.delete(audioUrl);
+    });
+
+    const audio = piperAudioRef.current;
+    if (audio) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      audio.remove();
+      piperAudioRef.current = null;
+    }
+  }
+
+  function cachePiperChunk(pageKey: string, chunkIndex: number, text: string): Promise<string> {
+    const cacheKey = getPiperAudioCacheKey(pageKey, chunkIndex);
+    const existingPromise = piperAudioCacheRef.current.get(cacheKey);
+    if (existingPromise) {
+      return existingPromise;
+    }
+
+    const generation = piperGenerationRef.current;
+    const promise = (async () => {
+      const blob = await generatePiperWav(text, piperVoiceRef.current);
+      if (generation !== piperGenerationRef.current) {
+        throw new DOMException("Speech cache was cleared.", "AbortError");
+      }
+      const audioUrl = URL.createObjectURL(blob);
+      piperAudioUrlsRef.current.add(audioUrl);
+      return audioUrl;
+    })().catch((error: unknown) => {
+      piperAudioCacheRef.current.delete(cacheKey);
+      if (generation !== piperGenerationRef.current && !(error instanceof DOMException)) {
+        throw new DOMException("Speech cache was cleared.", "AbortError");
+      }
+      throw error;
+    });
+    piperAudioCacheRef.current.set(cacheKey, promise);
+    return promise;
+  }
+
+  function prefetchPiperChunks(pageKey: string, chunks: string[], startIndex = 0): void {
+    chunks.slice(startIndex).forEach((chunk, offset) => {
+      void cachePiperChunk(pageKey, startIndex + offset, chunk).catch(() => undefined);
+    });
+  }
+
   function isSpeechPaused(): boolean {
     return speechPausedRef.current;
   }
@@ -1364,6 +1485,7 @@ function App() {
       clearSpeechPageTurnWait();
     }
     clearDeepgramPlayback();
+    clearPiperPlayback();
 
     if (isWebSpeechSupported()) {
       window.speechSynthesis.cancel();
@@ -1382,8 +1504,10 @@ function App() {
       speechChunksRef.current.length === 0 &&
       !speechShouldContinueRef.current &&
       !deepgramAudioRef.current &&
+      !piperAudioRef.current &&
       deepgramCacheQueueRef.current.length === 0 &&
       deepgramAudioCacheRef.current.size === 0 &&
+      piperAudioCacheRef.current.size === 0 &&
       deepgramAbortControllersRef.current.size === 0 &&
       !window.speechSynthesis?.speaking &&
       !window.speechSynthesis?.paused
@@ -1732,9 +1856,103 @@ function App() {
     void playAt(startIndex);
   }
 
+  function speakPiperChunks(startIndex = 0): void {
+    const chunks = speechChunksRef.current;
+    if (chunks.length === 0) {
+      setSpeechMode("error");
+      return;
+    }
+
+    const token = speechTokenRef.current + 1;
+    speechTokenRef.current = token;
+    speechChunkIndexRef.current = startIndex;
+    clearSpeechPageTurnWait();
+    void requestSpeechWakeLock();
+    const pageKey = speechPageKeyRef.current;
+    prefetchPiperChunks(pageKey, chunks, startIndex);
+
+    const playAt = async (index: number): Promise<void> => {
+      if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+        return;
+      }
+
+      if (index >= chunks.length) {
+        advanceAfterSpeechPage();
+        return;
+      }
+
+      speechChunkIndexRef.current = index;
+      setSpeechMode("loading");
+
+      try {
+        const audioUrl = await cachePiperChunk(pageKey, index, chunks[index]);
+        if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+          return;
+        }
+
+        const audio = getPiperAudioElement();
+        audio.pause();
+        audio.muted = false;
+        piperAudioRef.current = audio;
+
+        const releaseCompletedAudio = () => {
+          audio.onended = null;
+          audio.onerror = null;
+          piperAudioCacheRef.current.delete(getPiperAudioCacheKey(pageKey, index));
+          if (piperAudioUrlsRef.current.delete(audioUrl)) {
+            URL.revokeObjectURL(audioUrl);
+          }
+        };
+
+        audio.onended = () => {
+          releaseCompletedAudio();
+          if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
+            return;
+          }
+
+          speechChunkIndexRef.current = index + 1;
+          void playAt(index + 1);
+        };
+
+        audio.onerror = () => {
+          releaseCompletedAudio();
+          if (token === speechTokenRef.current) {
+            setSpeechError("The Piper audio could not be played.");
+            stopSpeech("error");
+          }
+        };
+
+        if (isSpeechPaused()) {
+          setSpeechMode("paused");
+          return;
+        }
+
+        audio.src = audioUrl;
+        audio.load();
+        setSpeechMode("playing");
+        await audio.play();
+      } catch (error) {
+        if ((error instanceof DOMException && error.name === "AbortError") || token !== speechTokenRef.current) {
+          return;
+        }
+
+        console.error(error);
+        setSpeechError(error instanceof Error ? error.message : "Piper speech playback failed.");
+        stopSpeech("error");
+      }
+    };
+
+    void playAt(startIndex);
+  }
+
   function speakSpeechChunks(startIndex = 0): void {
     if (speechProviderRef.current === "deepgram") {
       speakDeepgramChunks(startIndex);
+      return;
+    }
+
+    if (speechProviderRef.current === "piper") {
+      speakPiperChunks(startIndex);
       return;
     }
 
@@ -1795,28 +2013,28 @@ function App() {
     }
 
     if (speechMode === "playing") {
-      if (provider === "deepgram") {
-        stopSpeech();
-        return;
-      } else {
+      if (provider === "web-speech") {
         speechPausedRef.current = true;
         window.speechSynthesis.pause();
+        setSpeechMode("paused");
+        void releaseSpeechWakeLock();
+        return;
+      } else {
+        stopSpeech();
+        return;
       }
-      setSpeechMode("paused");
-      void releaseSpeechWakeLock();
-      return;
     }
 
     if (speechMode === "paused") {
-      if (provider === "deepgram") {
-        stopSpeech();
-      } else {
+      if (provider === "web-speech") {
         speechShouldContinueRef.current = true;
         speechPausedRef.current = false;
         window.speechSynthesis.resume();
         setSpeechMode("playing");
         void requestSpeechWakeLock();
         return;
+      } else {
+        stopSpeech();
       }
     }
 
@@ -1827,17 +2045,23 @@ function App() {
     }
 
     let playRequestToken = speechTokenRef.current;
-    if (provider === "deepgram") {
+    if (provider !== "web-speech") {
       stopSpeech();
       playRequestToken = speechTokenRef.current;
     }
 
-    setSpeechMode(provider === "deepgram" ? "loading" : "playing");
+    setSpeechMode(provider === "web-speech" ? "playing" : "loading");
     setSpeechError("");
     speechShouldContinueRef.current = true;
     speechPausedRef.current = false;
     if (provider === "deepgram") {
       primeDeepgramAudio();
+      if (playRequestToken !== speechTokenRef.current || !speechShouldContinueRef.current) {
+        return;
+      }
+    }
+    if (provider === "piper") {
+      primePiperAudio();
       if (playRequestToken !== speechTokenRef.current || !speechShouldContinueRef.current) {
         return;
       }
@@ -2571,9 +2795,11 @@ function App() {
     }
     const currentLanguage = speechLanguageRef.current || DEFAULT_SPEECH_LANGUAGE;
     const language =
-      provider === "deepgram" && !isDeepgramLanguageSupported(currentLanguage)
-        ? DEFAULT_SPEECH_LANGUAGE
-        : currentLanguage;
+      provider === "piper"
+        ? "tr-TR"
+        : provider === "deepgram" && !isDeepgramLanguageSupported(currentLanguage)
+          ? DEFAULT_SPEECH_LANGUAGE
+          : currentLanguage;
     const deepgramModel = isDeepgramModelForLanguage(deepgramModelRef.current, language)
       ? deepgramModelRef.current
       : getDefaultDeepgramModel(language);
@@ -2603,6 +2829,20 @@ function App() {
     }
   };
 
+  const updatePiperVoice = (voice: string) => {
+    if (!isPiperVoiceId(voice)) {
+      return;
+    }
+    piperVoiceRef.current = voice;
+    setSettings((currentSettings) => ({
+      ...currentSettings,
+      piperVoice: voice
+    }));
+    if (speechMode === "loading" || speechMode === "playing" || speechMode === "paused") {
+      stopSpeech();
+    }
+  };
+
   const readerTitle = bookInfo?.title || activeBook?.title || "EPUB Reader";
   const readerAuthor = bookInfo?.author || activeBook?.author || "";
   const selectedSpeechProvider = settings.speechProvider || DEFAULT_SPEECH_PROVIDER;
@@ -2611,7 +2851,14 @@ function App() {
     ? settings.deepgramModel || DEFAULT_DEEPGRAM_MODEL
     : getDefaultDeepgramModel(selectedSpeechLanguage);
   const speechLanguageOptions =
-    selectedSpeechProvider === "deepgram" ? DEEPGRAM_LANGUAGE_OPTIONS : WEB_SPEECH_LANGUAGE_OPTIONS;
+    selectedSpeechProvider === "piper"
+      ? PIPER_LANGUAGE_OPTIONS
+      : selectedSpeechProvider === "deepgram"
+        ? DEEPGRAM_LANGUAGE_OPTIONS
+        : WEB_SPEECH_LANGUAGE_OPTIONS;
+  const selectedPiperVoice = isPiperVoiceId(settings.piperVoice || "")
+    ? (settings.piperVoice as string)
+    : DEFAULT_PIPER_VOICE;
   const deepgramModelOptions = getDeepgramModelOptions(selectedSpeechLanguage);
   const currentProgress = areLocationsReady
     ? progress?.percentage ??
@@ -2631,13 +2878,13 @@ function App() {
   const isSpeechLoading = speechMode === "loading";
   const speechButtonTitle =
     speechMode === "unsupported"
-      ? `${selectedSpeechProvider === "deepgram" ? "Deepgram" : "Web Speech API"} is not supported in this browser`
+      ? `${getSpeechProviderLabel(selectedSpeechProvider)} is not supported in this browser`
       : speechMode === "error"
         ? `Read aloud failed (${selectedSpeechProvider}, ${selectedSpeechLanguage})`
       : speechMode === "loading"
         ? `Loading speech (${selectedSpeechProvider}, ${selectedSpeechLanguage})`
         : speechMode === "playing"
-          ? `${selectedSpeechProvider === "deepgram" ? "Stop" : "Pause"} read aloud (${selectedSpeechProvider}, ${selectedSpeechLanguage})`
+          ? `${selectedSpeechProvider === "web-speech" ? "Pause" : "Stop"} read aloud (${selectedSpeechProvider}, ${selectedSpeechLanguage})`
           : `Read this page aloud (${selectedSpeechProvider}, ${selectedSpeechLanguage})`;
   const isSpeechButtonDisabled =
     !activeBook ||
@@ -2725,6 +2972,21 @@ function App() {
               </option>
             ))}
           </select>
+          {selectedSpeechProvider === "piper" && (
+            <select
+              className="model-select"
+              value={selectedPiperVoice}
+              onChange={(event) => updatePiperVoice(event.currentTarget.value)}
+              title="Piper voice"
+              aria-label="Piper voice"
+            >
+              {PIPER_VOICE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          )}
           {selectedSpeechProvider === "deepgram" && (
             <select
               className="model-select"

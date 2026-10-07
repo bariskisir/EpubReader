@@ -19,7 +19,7 @@ The app also accepts `book` and `url` as legacy query parameter aliases:
 
 If no query string is provided, use the plus button to add an EPUB URL or upload a `.epub` file from your computer. Opening the same EPUB URL or uploaded file again reuses the existing saved book instead of adding a duplicate. Uploaded EPUB files are stored in the browser with IndexedDB.
 
-Use the play button in the top menu to listen to the current page. Deepgram is the default text-to-speech provider, with English and the Thalia Aura-2 voice selected by default. The provider dropdown can switch playback to the browser Web Speech API. When Deepgram is selected, the language and model dropdowns let you choose any supported Aura-2 language and voice. The reader pauses playback and automatically advances to the next page when the current page finishes.
+Use the play button in the top menu to listen to the current page. Deepgram is the default text-to-speech provider, with English and the Thalia Aura-2 voice selected by default. The provider dropdown can switch playback to the browser Web Speech API or to Piper, which runs locally in the browser with two Turkish voices (Dfki, Fahrettin). When Deepgram is selected, the language and model dropdowns let you choose any supported Aura-2 language and voice. The reader pauses playback and automatically advances to the next page when the current page finishes.
 
 GitHub `blob` and `raw` links are normalized automatically. For example, this:
 
