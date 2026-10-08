@@ -40,6 +40,14 @@ import {
   isPiperSupported,
   isPiperVoiceId
 } from "./piper";
+import {
+  DEFAULT_EMA_VOICE,
+  EMA_LANGUAGE_OPTIONS,
+  EMA_VOICE_OPTIONS,
+  generateEmaWav,
+  isEmaSupported,
+  isEmaVoiceId
+} from "./ema";
 
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
@@ -62,6 +70,7 @@ const DEFAULT_DEEPGRAM_MODEL = "aura-2-thalia-en";
 const SPEECH_PROVIDER_OPTIONS = [
   { value: "deepgram", label: "Deepgram" },
   { value: "web-speech", label: "Web Speech" },
+  { value: "ema", label: "Ema Lightning" },
   { value: "piper", label: "Piper (local)" }
 ] as const;
 const DEEPGRAM_LANGUAGE_OPTIONS = [
@@ -164,7 +173,8 @@ const defaultSettings: ReaderSettings = {
   speechProvider: DEFAULT_SPEECH_PROVIDER,
   speechLanguage: DEFAULT_SPEECH_LANGUAGE,
   deepgramModel: DEFAULT_DEEPGRAM_MODEL,
-  piperVoice: DEFAULT_PIPER_VOICE
+  piperVoice: DEFAULT_PIPER_VOICE,
+  emaVoice: DEFAULT_EMA_VOICE
 };
 
 const PROGRESS_METHOD = "displayed-pages-v1";
@@ -183,7 +193,7 @@ const readerThemeColors = {
 } as const;
 
 type Theme = keyof typeof readerThemeColors;
-type SpeechProvider = "deepgram" | "web-speech" | "piper";
+type SpeechProvider = "deepgram" | "web-speech" | "piper" | "ema";
 type BookSource = "url" | "file";
 
 type ReaderStatus = "idle" | "loading" | "ready" | "error";
@@ -196,6 +206,7 @@ interface ReaderSettings {
   speechLanguage?: string;
   deepgramModel?: string;
   piperVoice?: string;
+  emaVoice?: string;
 }
 
 interface ReadingPosition {
@@ -665,12 +676,18 @@ function isSpeechProviderSupported(provider: SpeechProvider): boolean {
   if (provider === "piper") {
     return isPiperSupported();
   }
+  if (provider === "ema") {
+    return isEmaSupported();
+  }
   return provider === "deepgram" || isWebSpeechSupported();
 }
 
 function getSpeechProviderLabel(provider: SpeechProvider): string {
   if (provider === "piper") {
     return "Piper";
+  }
+  if (provider === "ema") {
+    return "Ema Lightning";
   }
   return provider === "deepgram" ? "Deepgram" : "Web Speech API";
 }
@@ -1061,6 +1078,11 @@ function App() {
   const piperAudioUrlsRef = useRef<Set<string>>(new Set());
   const piperAudioCacheRef = useRef<Map<string, Promise<string>>>(new Map());
   const piperGenerationRef = useRef(0);
+  const emaVoiceRef = useRef(settings.emaVoice || DEFAULT_EMA_VOICE);
+  const emaAudioRef = useRef<HTMLAudioElement | null>(null);
+  const emaAudioUrlsRef = useRef<Set<string>>(new Set());
+  const emaAudioCacheRef = useRef<Map<string, Promise<string>>>(new Map());
+  const emaGenerationRef = useRef(0);
   const deepgramAudioUrlsRef = useRef<Set<string>>(new Set());
   const deepgramAudioCacheRef = useRef<Map<string, Promise<string>>>(new Map());
   const deepgramCachePagesRef = useRef<Map<string, DeepgramCachedPage>>(new Map());
@@ -1100,7 +1122,7 @@ function App() {
     const nextProvider = settings.speechProvider || DEFAULT_SPEECH_PROVIDER;
     const storedLanguage = settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE;
     const nextLanguage =
-      nextProvider === "piper"
+      nextProvider === "piper" || nextProvider === "ema"
         ? "tr-TR"
         : nextProvider === "deepgram" && !isDeepgramLanguageSupported(storedLanguage)
           ? DEFAULT_SPEECH_LANGUAGE
@@ -1111,10 +1133,14 @@ function App() {
     const nextPiperVoice = isPiperVoiceId(settings.piperVoice || "")
       ? (settings.piperVoice as string)
       : DEFAULT_PIPER_VOICE;
+    const nextEmaVoice = isEmaVoiceId(settings.emaVoice || "")
+      ? (settings.emaVoice as string)
+      : DEFAULT_EMA_VOICE;
     speechProviderRef.current = nextProvider;
     speechLanguageRef.current = nextLanguage;
     deepgramModelRef.current = nextDeepgramModel;
     piperVoiceRef.current = nextPiperVoice;
+    emaVoiceRef.current = nextEmaVoice;
     if (isWebSpeechSupported()) {
       speechVoiceRef.current = selectVoiceForLanguage(nextLanguage, window.speechSynthesis.getVoices());
       void getSpeechVoices().then((voices) => {
@@ -1128,14 +1154,16 @@ function App() {
       settings.speechProvider !== nextProvider ||
       settings.speechLanguage !== nextLanguage ||
       settings.deepgramModel !== nextDeepgramModel ||
-      settings.piperVoice !== nextPiperVoice
+      settings.piperVoice !== nextPiperVoice ||
+      settings.emaVoice !== nextEmaVoice
     ) {
       setSettings((currentSettings) => ({
         ...currentSettings,
         speechProvider: nextProvider,
         speechLanguage: nextLanguage,
         deepgramModel: nextDeepgramModel,
-        piperVoice: nextPiperVoice
+        piperVoice: nextPiperVoice,
+        emaVoice: nextEmaVoice
       }));
     }
   }, [settings]);
@@ -1463,6 +1491,93 @@ function App() {
     });
   }
 
+  function getEmaAudioCacheKey(pageKey: string, chunkIndex: number): string {
+    return `${emaVoiceRef.current}\n${pageKey}\n${chunkIndex}`;
+  }
+
+  function getEmaAudioElement(): HTMLAudioElement {
+    const audio = emaAudioRef.current || document.createElement("audio");
+    emaAudioRef.current = audio;
+    audio.autoplay = true;
+    audio.controls = false;
+    audio.preload = "auto";
+    audio.setAttribute("playsinline", "");
+    audio.setAttribute("webkit-playsinline", "");
+    audio.setAttribute("aria-hidden", "true");
+    audio.style.position = "fixed";
+    audio.style.width = "1px";
+    audio.style.height = "1px";
+    audio.style.opacity = "0";
+    audio.style.pointerEvents = "none";
+    if (!audio.isConnected) {
+      document.body.appendChild(audio);
+    }
+    return audio;
+  }
+
+  function primeEmaAudio(): HTMLAudioElement {
+    const audio = getEmaAudioElement();
+    audio.src = SILENT_AUDIO_URL;
+    audio.load();
+    void audio.play().catch(() => {
+      // The real playback attempt below will surface a useful browser error.
+    });
+    return audio;
+  }
+
+  function clearEmaPlayback(): void {
+    emaGenerationRef.current += 1;
+    emaAudioCacheRef.current.clear();
+    [...emaAudioUrlsRef.current].forEach((audioUrl) => {
+      URL.revokeObjectURL(audioUrl);
+      emaAudioUrlsRef.current.delete(audioUrl);
+    });
+
+    const audio = emaAudioRef.current;
+    if (audio) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      audio.remove();
+      emaAudioRef.current = null;
+    }
+  }
+
+  function cacheEmaChunk(pageKey: string, chunkIndex: number, text: string): Promise<string> {
+    const cacheKey = getEmaAudioCacheKey(pageKey, chunkIndex);
+    const existingPromise = emaAudioCacheRef.current.get(cacheKey);
+    if (existingPromise) {
+      return existingPromise;
+    }
+
+    const generation = emaGenerationRef.current;
+    const promise = (async () => {
+      const blob = await generateEmaWav(text, emaVoiceRef.current);
+      if (generation !== emaGenerationRef.current) {
+        throw new DOMException("Speech cache was cleared.", "AbortError");
+      }
+      const audioUrl = URL.createObjectURL(blob);
+      emaAudioUrlsRef.current.add(audioUrl);
+      return audioUrl;
+    })().catch((error: unknown) => {
+      emaAudioCacheRef.current.delete(cacheKey);
+      if (generation !== emaGenerationRef.current && !(error instanceof DOMException)) {
+        throw new DOMException("Speech cache was cleared.", "AbortError");
+      }
+      throw error;
+    });
+    emaAudioCacheRef.current.set(cacheKey, promise);
+    return promise;
+  }
+
+  function prefetchEmaChunks(pageKey: string, chunks: string[], startIndex = 0): void {
+    chunks.slice(startIndex).forEach((chunk, offset) => {
+      void cacheEmaChunk(pageKey, startIndex + offset, chunk).catch(() => undefined);
+    });
+  }
+
   function isSpeechPaused(): boolean {
     return speechPausedRef.current;
   }
@@ -1486,6 +1601,7 @@ function App() {
     }
     clearDeepgramPlayback();
     clearPiperPlayback();
+    clearEmaPlayback();
 
     if (isWebSpeechSupported()) {
       window.speechSynthesis.cancel();
@@ -1505,9 +1621,11 @@ function App() {
       !speechShouldContinueRef.current &&
       !deepgramAudioRef.current &&
       !piperAudioRef.current &&
+      !emaAudioRef.current &&
       deepgramCacheQueueRef.current.length === 0 &&
       deepgramAudioCacheRef.current.size === 0 &&
       piperAudioCacheRef.current.size === 0 &&
+      emaAudioCacheRef.current.size === 0 &&
       deepgramAbortControllersRef.current.size === 0 &&
       !window.speechSynthesis?.speaking &&
       !window.speechSynthesis?.paused
@@ -1945,6 +2063,95 @@ function App() {
     void playAt(startIndex);
   }
 
+  function speakEmaChunks(startIndex = 0): void {
+    const chunks = speechChunksRef.current;
+    if (chunks.length === 0) {
+      setSpeechMode("error");
+      return;
+    }
+
+    const token = speechTokenRef.current + 1;
+    speechTokenRef.current = token;
+    speechChunkIndexRef.current = startIndex;
+    clearSpeechPageTurnWait();
+    void requestSpeechWakeLock();
+    const pageKey = speechPageKeyRef.current;
+    prefetchEmaChunks(pageKey, chunks, startIndex);
+
+    const playAt = async (index: number): Promise<void> => {
+      if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+        return;
+      }
+
+      if (index >= chunks.length) {
+        advanceAfterSpeechPage();
+        return;
+      }
+
+      speechChunkIndexRef.current = index;
+      setSpeechMode("loading");
+
+      try {
+        const audioUrl = await cacheEmaChunk(pageKey, index, chunks[index]);
+        if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+          return;
+        }
+
+        const audio = getEmaAudioElement();
+        audio.pause();
+        audio.muted = false;
+        emaAudioRef.current = audio;
+
+        const releaseCompletedAudio = () => {
+          audio.onended = null;
+          audio.onerror = null;
+          emaAudioCacheRef.current.delete(getEmaAudioCacheKey(pageKey, index));
+          if (emaAudioUrlsRef.current.delete(audioUrl)) {
+            URL.revokeObjectURL(audioUrl);
+          }
+        };
+
+        audio.onended = () => {
+          releaseCompletedAudio();
+          if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
+            return;
+          }
+
+          speechChunkIndexRef.current = index + 1;
+          void playAt(index + 1);
+        };
+
+        audio.onerror = () => {
+          releaseCompletedAudio();
+          if (token === speechTokenRef.current) {
+            setSpeechError("The Ema audio could not be played.");
+            stopSpeech("error");
+          }
+        };
+
+        if (isSpeechPaused()) {
+          setSpeechMode("paused");
+          return;
+        }
+
+        audio.src = audioUrl;
+        audio.load();
+        setSpeechMode("playing");
+        await audio.play();
+      } catch (error) {
+        if ((error instanceof DOMException && error.name === "AbortError") || token !== speechTokenRef.current) {
+          return;
+        }
+
+        console.error(error);
+        setSpeechError(error instanceof Error ? error.message : "Ema speech playback failed.");
+        stopSpeech("error");
+      }
+    };
+
+    void playAt(startIndex);
+  }
+
   function speakSpeechChunks(startIndex = 0): void {
     if (speechProviderRef.current === "deepgram") {
       speakDeepgramChunks(startIndex);
@@ -1953,6 +2160,11 @@ function App() {
 
     if (speechProviderRef.current === "piper") {
       speakPiperChunks(startIndex);
+      return;
+    }
+
+    if (speechProviderRef.current === "ema") {
+      speakEmaChunks(startIndex);
       return;
     }
 
@@ -2062,6 +2274,12 @@ function App() {
     }
     if (provider === "piper") {
       primePiperAudio();
+      if (playRequestToken !== speechTokenRef.current || !speechShouldContinueRef.current) {
+        return;
+      }
+    }
+    if (provider === "ema") {
+      primeEmaAudio();
       if (playRequestToken !== speechTokenRef.current || !speechShouldContinueRef.current) {
         return;
       }
@@ -2795,7 +3013,7 @@ function App() {
     }
     const currentLanguage = speechLanguageRef.current || DEFAULT_SPEECH_LANGUAGE;
     const language =
-      provider === "piper"
+      provider === "piper" || provider === "ema"
         ? "tr-TR"
         : provider === "deepgram" && !isDeepgramLanguageSupported(currentLanguage)
           ? DEFAULT_SPEECH_LANGUAGE
@@ -2843,6 +3061,20 @@ function App() {
     }
   };
 
+  const updateEmaVoice = (voice: string) => {
+    if (!isEmaVoiceId(voice)) {
+      return;
+    }
+    emaVoiceRef.current = voice;
+    setSettings((currentSettings) => ({
+      ...currentSettings,
+      emaVoice: voice
+    }));
+    if (speechMode === "loading" || speechMode === "playing" || speechMode === "paused") {
+      stopSpeech();
+    }
+  };
+
   const readerTitle = bookInfo?.title || activeBook?.title || "EPUB Reader";
   const readerAuthor = bookInfo?.author || activeBook?.author || "";
   const selectedSpeechProvider = settings.speechProvider || DEFAULT_SPEECH_PROVIDER;
@@ -2853,12 +3085,17 @@ function App() {
   const speechLanguageOptions =
     selectedSpeechProvider === "piper"
       ? PIPER_LANGUAGE_OPTIONS
-      : selectedSpeechProvider === "deepgram"
-        ? DEEPGRAM_LANGUAGE_OPTIONS
-        : WEB_SPEECH_LANGUAGE_OPTIONS;
+      : selectedSpeechProvider === "ema"
+        ? EMA_LANGUAGE_OPTIONS
+        : selectedSpeechProvider === "deepgram"
+          ? DEEPGRAM_LANGUAGE_OPTIONS
+          : WEB_SPEECH_LANGUAGE_OPTIONS;
   const selectedPiperVoice = isPiperVoiceId(settings.piperVoice || "")
     ? (settings.piperVoice as string)
     : DEFAULT_PIPER_VOICE;
+  const selectedEmaVoice = isEmaVoiceId(settings.emaVoice || "")
+    ? (settings.emaVoice as string)
+    : DEFAULT_EMA_VOICE;
   const deepgramModelOptions = getDeepgramModelOptions(selectedSpeechLanguage);
   const currentProgress = areLocationsReady
     ? progress?.percentage ??
@@ -2972,6 +3209,21 @@ function App() {
               </option>
             ))}
           </select>
+          {selectedSpeechProvider === "ema" && (
+            <select
+              className="model-select"
+              value={selectedEmaVoice}
+              onChange={(event) => updateEmaVoice(event.currentTarget.value)}
+              title="Ema voice"
+              aria-label="Ema voice"
+            >
+              {EMA_VOICE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          )}
           {selectedSpeechProvider === "piper" && (
             <select
               className="model-select"
