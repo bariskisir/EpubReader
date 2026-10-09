@@ -10,22 +10,16 @@ import {
   type SetStateAction
 } from "react";
 import { createRoot } from "react-dom/client";
-import ePub from "epubjs";
-import type Book from "epubjs/types/book";
-import type Contents from "epubjs/types/contents";
-import type { Location } from "epubjs/types/rendition";
-import type Rendition from "epubjs/types/rendition";
 import {
   BookOpen,
-  Library,
+  BookMarked,
+  ChevronRight,
   LoaderCircle,
-  Menu,
   Minus,
-  Moon,
+  PanelLeft,
   Pause,
   Play,
   Plus,
-  Sun,
   Trash2,
   Upload,
   X
@@ -48,6 +42,29 @@ import {
   isEmaSupported,
   isEmaVoiceId
 } from "./ema";
+import {
+  getDefaultViewSettings,
+  getMaxInlineSize,
+  type DefaultFont,
+  type ReaderThemeCode,
+  type ViewSettings
+} from "./reader/settings";
+import { getStyles, transformStylesheet } from "./reader/style";
+import {
+  applyImageStyle,
+  applyLinkHitArea,
+  applyNamespacedAttributes,
+  applyScrollModeClass,
+  applyThemeModeClass
+} from "./reader/doc";
+import { viewPagination, type PaginationSide } from "./reader/pagination";
+import {
+  buildPageTable,
+  currentPageNumber,
+  totalPages as totalRealPages,
+  type PageCounterRenderer,
+  type PageTable
+} from "./reader/page-count";
 
 const LIBRARY_KEY = "epub-reader:library:v1";
 const SETTINGS_KEY = "epub-reader:settings:v1";
@@ -56,6 +73,21 @@ const UPLOADED_BOOK_STORE_NAME = "files";
 const MAX_SPEECH_CHUNK_LENGTH = 900;
 const EPUB_OPEN_TIMEOUT_MS = 20000;
 const SPEECH_PAGE_TURN_TIMEOUT_MS = 2500;
+// Elle sayfa çevirme, konum değişimini bekler. Uzun tutmak hızlı basışta
+// okuyucuyu "donmuş" gibi gösteriyor; bu yalnızca güvenlik ağı.
+const MANUAL_PAGE_TURN_TIMEOUT_MS = 900;
+// Elle çevirme sürerken konuşmanın sayfa takibi bunu kadar tekrar dener.
+const SPEECH_ADVANCE_RETRY_MS = 120;
+const MAX_SPEECH_ADVANCE_RETRIES = 25;
+// Network TTS: a single chunk request must never hang forever, otherwise the
+// reader sits on one page with no error and no page turn.
+const DEEPGRAM_REQUEST_TIMEOUT_MS = 25000;
+// Audio playback: play() may stay pending (autoplay policy) and 'ended' may
+// never fire (stalled decode) — both look like "stuck on one page".
+const SPEECH_AUDIO_PLAY_TIMEOUT_MS = 15000;
+// Web Speech: speak() right after cancel() is swallowed by Chrome often
+// enough that the first utterance never starts; defer it slightly.
+const WEB_SPEECH_START_DELAY_MS = 150;
 const DEEPGRAM_CACHED_PAGE_COUNT = 3;
 const DEEPGRAM_PROGRESSIVE_SENTENCE_COUNT = 100;
 const DEEPGRAM_PROGRESSIVE_GROUP_SIZES = [1, 1, 1, 2, 2, 2] as const;
@@ -168,8 +200,9 @@ const DEEPGRAM_VOICES: Record<string, readonly string[]> = {
 };
 
 const defaultSettings: ReaderSettings = {
-  fontSize: 100,
   theme: "dark",
+  themeName: "default",
+  viewSettings: getDefaultViewSettings(),
   speechProvider: DEFAULT_SPEECH_PROVIDER,
   speechLanguage: DEFAULT_SPEECH_LANGUAGE,
   deepgramModel: DEFAULT_DEEPGRAM_MODEL,
@@ -177,22 +210,100 @@ const defaultSettings: ReaderSettings = {
   emaVoice: DEFAULT_EMA_VOICE
 };
 
-const PROGRESS_METHOD = "displayed-pages-v1";
-
-const readerThemeColors = {
-  light: {
-    background: "#faf8f2",
-    text: "#191815",
-    link: "#7b3f1d"
-  },
-  dark: {
-    background: "#16181b",
-    text: "#ece7dd",
-    link: "#d8a465"
+// Eski sürümlerde yalnızca `fontSize` (yüzde) vardı. Kayıtlı ayarı yeni
+// Readest ViewSettings modeline taşı; eksik alanları varsayılanlarla doldur.
+function normalizeSettings(stored: Partial<ReaderSettings> & { fontSize?: number }): ReaderSettings {
+  const defaults = getDefaultViewSettings();
+  const storedView = stored.viewSettings as Partial<ViewSettings> | undefined;
+  const migrated: Partial<ViewSettings> = {};
+  if (!storedView && typeof stored.fontSize === "number") {
+    migrated.defaultFontSize = Math.round(16 * (stored.fontSize / 100) * 10) / 10;
   }
-} as const;
+  return {
+    ...defaultSettings,
+    ...stored,
+    viewSettings: { ...defaults, ...migrated, ...(storedView || {}) }
+  };
+}
 
-type Theme = keyof typeof readerThemeColors;
+const PROGRESS_METHOD = "foliate-fraction-v1";
+
+// Readest'teki 11 renk temasının baz renkleri (tek CSS'teki
+// [data-theme="<ad>-<light|dark>"] bloklarıyla birebir aynı değerler).
+// EPUB içeriğinin zemin/metin/bağlantı renkleri buradan gelir.
+const THEME_BASE_COLORS: Record<string, { light: ThemeBaseColor; dark: ThemeBaseColor }> = {
+  default: {
+    light: { bg: "#ffffff", fg: "#171717", primary: "#0066cc" },
+    dark: { bg: "#222222", fg: "#e0e0e0", primary: "#77bbee" }
+  },
+  gray: {
+    light: { bg: "#e0e0e0", fg: "#222222", primary: "#4488cc" },
+    dark: { bg: "#444444", fg: "#c6c6c6", primary: "#88ccee" }
+  },
+  sepia: {
+    light: { bg: "#f1e8d0", fg: "#5b4636", primary: "#008b8b" },
+    dark: { bg: "#342e25", fg: "#ffd595", primary: "#48d1cc" }
+  },
+  grass: {
+    light: { bg: "#d7dbbd", fg: "#232c16", primary: "#177b4d" },
+    dark: { bg: "#333627", fg: "#d8deba", primary: "#a6d608" }
+  },
+  cherry: {
+    light: { bg: "#f0d1d5", fg: "#4e1609", primary: "#de3838" },
+    dark: { bg: "#462f32", fg: "#e5c4c8", primary: "#ff646e" }
+  },
+  sky: {
+    light: { bg: "#cedef5", fg: "#262d48", primary: "#2d53e5" },
+    dark: { bg: "#282e47", fg: "#babee1", primary: "#ff646e" }
+  },
+  solarized: {
+    light: { bg: "#fdf6e3", fg: "#586e75", primary: "#268bd2" },
+    dark: { bg: "#002b36", fg: "#93a1a1", primary: "#268bd2" }
+  },
+  gruvbox: {
+    light: { bg: "#fbf1c7", fg: "#3c3836", primary: "#076678" },
+    dark: { bg: "#282828", fg: "#ebdbb2", primary: "#83a598" }
+  },
+  nord: {
+    light: { bg: "#eceff4", fg: "#2e3440", primary: "#5e81ac" },
+    dark: { bg: "#2e3440", fg: "#d8dee9", primary: "#88c0d0" }
+  },
+  contrast: {
+    light: { bg: "#ffffff", fg: "#000000", primary: "#4488cc" },
+    dark: { bg: "#000000", fg: "#ffffff", primary: "#88ccee" }
+  },
+  sunset: {
+    light: { bg: "#fff7f0", fg: "#423126", primary: "#fe6b64" },
+    dark: { bg: "#3c2b25", fg: "#f6e1d7", primary: "#ff9c94" }
+  }
+};
+
+const THEME_OPTIONS = [
+  { value: "default", label: "Default" },
+  { value: "gray", label: "Gray" },
+  { value: "sepia", label: "Sepia" },
+  { value: "grass", label: "Grass" },
+  { value: "cherry", label: "Cherry" },
+  { value: "sky", label: "Sky" },
+  { value: "solarized", label: "Solarized" },
+  { value: "gruvbox", label: "Gruvbox" },
+  { value: "nord", label: "Nord" },
+  { value: "contrast", label: "Contrast" },
+  { value: "sunset", label: "Sunset" }
+] as const;
+
+interface ThemeBaseColor {
+  bg: string;
+  fg: string;
+  primary: string;
+}
+
+function getReaderColors(themeName: string, mode: "light" | "dark"): ThemeBaseColor {
+  const entry = THEME_BASE_COLORS[themeName] || THEME_BASE_COLORS.default!;
+  return entry[mode];
+}
+
+type Theme = "light" | "dark";
 type SpeechProvider = "deepgram" | "web-speech" | "piper" | "ema";
 type BookSource = "url" | "file";
 
@@ -200,8 +311,10 @@ type ReaderStatus = "idle" | "loading" | "ready" | "error";
 type SpeechMode = "idle" | "loading" | "playing" | "paused" | "unsupported" | "error";
 
 interface ReaderSettings {
-  fontSize: number;
   theme: Theme;
+  themeName?: string;
+  /** Okuma görünümü: Readest'in ViewSettings modeli (font, düzen, paragraf). */
+  viewSettings: ViewSettings;
   speechProvider?: SpeechProvider;
   speechLanguage?: string;
   deepgramModel?: string;
@@ -246,10 +359,6 @@ interface ReaderProgress {
 
 type PersistentState<T> = [T, Dispatch<SetStateAction<T>>];
 
-interface RuntimeSpine {
-  length?: number;
-}
-
 interface VisibleSpeechSnapshot {
   text: string;
   languageHint: string;
@@ -287,7 +396,43 @@ interface BrowserWithScreenWakeLock {
 }
 
 interface ResolvedBookSource {
-  input: string | ArrayBuffer;
+  input: string | File;
+  fileName?: string;
+}
+
+function destroyFoliateView(view: FoliateViewElement | null): void {
+  if (!view) {
+    return;
+  }
+
+  try {
+    view.close();
+  } catch {
+    // Zaten kapanmış olabilir.
+  }
+  view.remove();
+}
+
+function guardFoliateDoc(doc: Document): void {
+  const root = doc.documentElement;
+  if (!root || root.dataset.readerInputGuards) {
+    return;
+  }
+
+  root.dataset.readerInputGuards = "true";
+  const preventDefault = (event: Event) => event.preventDefault();
+  doc.addEventListener("selectstart", preventDefault);
+  doc.addEventListener("gesturestart", preventDefault);
+  doc.addEventListener("gesturechange", preventDefault);
+  doc.defaultView?.addEventListener(
+    "wheel",
+    (event) => {
+      if ((event as WheelEvent).ctrlKey) {
+        event.preventDefault();
+      }
+    },
+    { passive: false }
+  );
 }
 
 function hashText(text: string): string {
@@ -487,7 +632,17 @@ function getBookDescription(book: LibraryBook): string {
 
 async function resolveBookSource(book: LibraryBook): Promise<ResolvedBookSource> {
   if (getBookSource(book) !== "file") {
-    return { input: book.url };
+    let fileName = "book.epub";
+    try {
+      const pathname = new URL(book.url, window.location.href).pathname;
+      const lastSegment = pathname.split("/").filter(Boolean).pop();
+      if (lastSegment) {
+        fileName = decodeURIComponent(lastSegment);
+      }
+    } catch {
+      // Varsayılan dosya adı kullanılır.
+    }
+    return { input: book.url, fileName };
   }
 
   if (!book.fileStorageKey) {
@@ -499,7 +654,14 @@ async function resolveBookSource(book: LibraryBook): Promise<ResolvedBookSource>
     throw new Error("Uploaded EPUB file is missing from browser storage.");
   }
 
-  return { input: await blob.arrayBuffer() };
+  const fileName = book.fileName || "book.epub";
+  return {
+    // Foliate chooses the importer from both the bytes and `File.name`.  Keep a
+    // real File here: a bare Blob/ArrayBuffer has no name and makes the
+    // Readest/Foliate format detector fail before it can open an EPUB.
+    input: new File([blob], fileName, { type: blob.type || "application/epub+zip" }),
+    fileName
+  };
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -511,16 +673,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
       .catch(reject)
       .finally(() => window.clearTimeout(timeoutId));
   });
-}
-
-function createEpubBook(input: string | ArrayBuffer): { book: Book; openPromise: Promise<object> } {
-  const book = ePub();
-
-  if (typeof input === "string") {
-    return { book, openPromise: book.open(input) };
-  }
-
-  return { book, openPromise: book.open(input.slice(0), "binary") };
 }
 
 function toDisplayPercentage(value: number | string | null | undefined): number | null {
@@ -540,132 +692,290 @@ function formatProgress(value: number | string | null | undefined): string {
 
   return `${Number.isInteger(percentage) ? percentage : percentage.toFixed(1)}%`;
 }
+/* Foliate (Readest motoru) okuyucu konumu: epubjs Location yerine geçer. */
+interface ReaderLoc {
+  cfi: string;
+  href: string;
+  atEnd: boolean;
+  atStart: boolean;
+}
 
-function getDisplayedPagePercentage(book: Book, location: Location): number | null {
-  const start = location?.start;
-  const spineLength = Number((book.spine as RuntimeSpine).length || 0);
-  const sectionIndex = Number(start?.index);
-  const page = Number(start?.displayed?.page || 1);
-  const totalPages = Number(start?.displayed?.total || 1);
+interface FoliateSectionProgress {
+  current: number;
+  total: number;
+}
 
-  if (!spineLength || Number.isNaN(sectionIndex)) {
+interface FoliateLocationProgress {
+  current: number;
+  next: number;
+  total: number;
+}
+
+interface FoliateRelocateDetail {
+  cfi: string;
+  fraction: number;
+  index: number;
+  range: Range | null;
+  section?: FoliateSectionProgress;
+  location?: FoliateLocationProgress;
+}
+
+interface FoliateRenderer {
+  setStyles?(styles: string): void;
+  setAttribute(name: string, value?: string): void;
+  removeAttribute(name: string): void;
+  getContents(): { doc: Document; index: number }[];
+  /** Ekranda görünen bölüm indeksi. */
+  primaryIndex: number;
+  /** Şerit içindeki sayfa indeksi (0 tabanlı). */
+  page: number;
+  /** Birincil bölümün ekranda kaç sayfa tuttuğu. */
+  pages: number;
+  destroy?(): void;
+  addEventListener(type: "stabilized", listener: EventListener): void;
+  removeEventListener(type: "stabilized", listener: EventListener): void;
+}
+
+interface FoliateBook {
+  metadata?: {
+    title?: unknown;
+    author?: unknown;
+    language?: unknown;
+  };
+  sections: { id?: unknown; linear?: string; cfi?: string }[];
+  rendition?: { layout?: string; spread?: string };
+  dir?: string;
+  toc?: unknown;
+  transformTarget?: EventTarget;
+}
+
+interface FoliateViewElement extends HTMLElement {
+  open(book: string | Blob): Promise<void>;
+  close(): void;
+  init(options: { lastLocation?: string; showTextStart?: boolean }): Promise<void>;
+  goTo(target: string | number | { fraction: number }): Promise<unknown>;
+  goToFraction(fraction: number): Promise<void>;
+  next(distance?: number): Promise<void>;
+  prev(distance?: number): Promise<void>;
+  getCFI(index: number, range: Range | null): string | null;
+  getSectionFractions(): number[];
+  renderer: FoliateRenderer;
+  book: FoliateBook | null;
+  lastLocation: unknown;
+}
+
+function toReaderLoc(detail: FoliateRelocateDetail | null): ReaderLoc | null {
+  if (!detail || !detail.cfi) {
     return null;
   }
 
-  if (location?.atEnd) {
-    return 100;
-  }
-
-  const sectionProgress = totalPages > 0 ? (Math.max(page, 1) - 1) / totalPages : 0;
-  return toDisplayPercentage(((sectionIndex + sectionProgress) / spineLength) * 100);
-}
-
-function getReadingPercentage(book: Book, location: Location): number | null {
-  const cfi = location?.start?.cfi;
-  const generatedLocationCount = book.locations?.length?.() || 0;
-
-  if (cfi && generatedLocationCount > 0) {
-    return toDisplayPercentage(book.locations.percentageFromCfi(cfi) * 100);
-  }
-
-  return getDisplayedPagePercentage(book, location);
-}
-
-function getReadingPageInfo(
-  book: Book,
-  location: Location,
-  percentage: number | null
-): { page: number | null; totalPages: number | null } {
-  const generatedLocationCount = book.locations?.length?.() || 0;
-
-  if (generatedLocationCount > 0) {
-    if (location?.atEnd) {
-      return { page: generatedLocationCount, totalPages: generatedLocationCount };
-    }
-
-    const normalizedPercentage = Math.min(100, Math.max(0, percentage ?? 0));
-    const page = Math.floor((normalizedPercentage / 100) * generatedLocationCount) + 1;
-    return { page: Math.min(generatedLocationCount, Math.max(1, page)), totalPages: generatedLocationCount };
-  }
-
+  const fraction = Number(detail.fraction) || 0;
   return {
-    page: location?.start?.displayed?.page || null,
-    totalPages: location?.start?.displayed?.total || null
+    cfi: detail.cfi,
+    href: "",
+    atEnd: fraction >= 0.999,
+    atStart: fraction <= 0.001
   };
 }
 
-function applyContentStyles(contents: Contents, settings: ReaderSettings): void {
-  const colors = readerThemeColors[settings.theme] || readerThemeColors.light;
-  const documentElement = contents.document?.documentElement;
-  const body = contents.document?.body;
-  const preventDefault = (event: Event) => event.preventDefault();
+function getLocationSpeechKey(location: ReaderLoc | null): string {
+  return location?.cfi || "";
+}
 
-  contents.css("font-size", `${settings.fontSize}%`, true);
-  contents.css("font-family", "Georgia, Cambria, 'Times New Roman', serif", true);
-  contents.css("line-height", "1.65", true);
-  contents.css("color", colors.text, true);
-  contents.css("background", colors.background, true);
-  contents.css("background-color", colors.background, true);
-  contents.css("user-select", "none", true);
-  contents.css("-webkit-user-select", "none", true);
-  contents.css("-webkit-touch-callout", "none", true);
-  if (documentElement) {
-    documentElement.style.setProperty("background", colors.background, "important");
-    documentElement.style.setProperty("color", colors.text, "important");
-    documentElement.style.setProperty("user-select", "none", "important");
-    documentElement.style.setProperty("-webkit-user-select", "none", "important");
-    documentElement.style.setProperty("-webkit-touch-callout", "none", "important");
+// Sayfa çevirmenin ilerleyip ilerlemediğini görmek için ucuz bir imza:
+// görünen bölüm + o bölümdeki sayfa indeksi.
+function getRendererSignature(view: FoliateViewElement | null): string {
+  if (!view) {
+    return "";
   }
-
-  if (body) {
-    body.style.setProperty("background", colors.background, "important");
-    body.style.setProperty("color", colors.text, "important");
-    body.style.setProperty("user-select", "none", "important");
-    body.style.setProperty("-webkit-user-select", "none", "important");
-    body.style.setProperty("-webkit-touch-callout", "none", "important");
-  }
-
-  contents.document?.querySelectorAll?.("a").forEach((link) => {
-    link.style.setProperty("color", colors.link, "important");
-  });
-
-  if (contents.document?.documentElement && !contents.document.documentElement.dataset.readerInputGuards) {
-    contents.document.documentElement.dataset.readerInputGuards = "true";
-    contents.document.addEventListener("selectstart", preventDefault);
-    contents.document.addEventListener("gesturestart", preventDefault);
-    contents.document.addEventListener("gesturechange", preventDefault);
-    contents.window?.addEventListener(
-      "wheel",
-      (event) => {
-        if (event.ctrlKey) {
-          event.preventDefault();
-        }
-      },
-      { passive: false }
-    );
+  try {
+    const renderer = view.renderer;
+    return `${renderer.primaryIndex}:${renderer.page}`;
+  } catch {
+    return "";
   }
 }
 
-function getRenditionContents(rendition: Rendition): Contents[] {
-  const contents = rendition.getContents() as Contents | Contents[];
-  if (!contents) {
-    return [];
+function getFoliateProgress(detail: FoliateRelocateDetail | null): {
+  percentage: number | null;
+  page: number | null;
+  totalPages: number | null;
+} {
+  if (!detail) {
+    return { percentage: null, page: null, totalPages: null };
   }
-  return Array.isArray(contents) ? contents : [contents];
+
+  const percentage = toDisplayPercentage((Number(detail.fraction) || 0) * 100);
+  const loc = detail.location;
+  if (loc && Number.isFinite(loc.total) && loc.total > 0) {
+    const totalPages = Math.max(1, Math.floor(loc.total));
+    const page = Math.min(totalPages, Math.max(1, Math.floor(Number(loc.current) || 0) + 1));
+    return { percentage, page, totalPages };
+  }
+
+  const section = detail.section;
+  if (section && section.total > 0) {
+    return {
+      percentage,
+      page: Math.min(section.total, Math.max(1, section.current + 1)),
+      totalPages: section.total
+    };
+  }
+
+  return { percentage, page: null, totalPages: null };
 }
 
-function applyReaderPreferences(rendition: Rendition | null, settings: ReaderSettings): void {
-  if (!rendition) {
+function normalizeMetaText(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeMetaText).filter(Boolean).join(", ");
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const name = record.name;
+    if (typeof name === "string" && name.trim()) {
+      return name.trim();
+    }
+    const direct = record.value;
+    if (typeof direct === "string" && direct.trim()) {
+      return direct.trim();
+    }
+    for (const key of Object.keys(record)) {
+      const entry = record[key];
+      if (typeof entry === "string" && entry.trim()) {
+        return entry.trim();
+      }
+    }
+  }
+
+  return "";
+}
+
+function toReaderThemeCode(settings: ReaderSettings): ReaderThemeCode {
+  const mode = settings.theme === "light" ? "light" : "dark";
+  const colors = getReaderColors(settings.themeName || "default", mode);
+  return { bg: colors.bg, fg: colors.fg, primary: colors.primary, isDarkMode: mode === "dark" };
+}
+
+// Readest: getStyles(viewSettings, themeCode). Okuma görünümünün tamamı
+// (font, paragraf aralığı, kenar boşlukları, renk) buradan gelir.
+function buildFoliateStyles(settings: ReaderSettings): string {
+  return getStyles(settings.viewSettings, toReaderThemeCode(settings));
+}
+
+function applyFoliateStyles(view: FoliateViewElement | null, settings: ReaderSettings): void {
+  try {
+    view?.renderer.setStyles?.(buildFoliateStyles(settings));
+  } catch {
+    // Stil enjeksiyonu kritik değildir; okuma devam eder.
+  }
+}
+
+// Readest: FoliateViewer'ın `applyMarginAndGap` + renderer nitelikleri.
+// Her nitelik paginator içinde bir `--_*` değişkenine eşlenir ve sütun /
+// sayfa hesabını doğrudan belirler.
+function applyFoliateLayout(view: FoliateViewElement | null, settings: ReaderSettings): void {
+  if (!view) {
     return;
   }
 
-  rendition.themes.fontSize(`${settings.fontSize}%`);
-  rendition.themes.select(settings.theme);
-  getRenditionContents(rendition).forEach((contents) => applyContentStyles(contents, settings));
+  const vs = settings.viewSettings;
+  try {
+    const renderer = view.renderer;
+    renderer.setAttribute("max-column-count", String(vs.maxColumnCount));
+    renderer.setAttribute("max-inline-size", `${getMaxInlineSize(vs)}px`);
+    renderer.setAttribute("max-block-size", `${vs.maxBlockSize}px`);
+    renderer.setAttribute("gap", `${vs.gapPercent}%`);
+    renderer.setAttribute("margin-top", `${vs.marginTopPx}px`);
+    renderer.setAttribute("margin-bottom", `${vs.marginBottomPx}px`);
+    renderer.setAttribute("margin-left", `${vs.marginLeftPx}px`);
+    renderer.setAttribute("margin-right", `${vs.marginRightPx}px`);
+    if (vs.columnGapPx > 0) {
+      renderer.setAttribute("column-gap", `${vs.columnGapPx}px`);
+    } else {
+      renderer.removeAttribute("column-gap");
+    }
+    if (vs.animated) {
+      renderer.setAttribute("animated", "");
+    } else {
+      renderer.removeAttribute("animated");
+    }
+    if (view.book?.rendition?.layout === "pre-paginated") {
+      renderer.setAttribute("spread", vs.spreadMode);
+    }
+  } catch {
+    // Eski motor uyumsuzsa varsayılan sayfa düzeni geçerli kalır.
+  }
 }
-
 function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+// Rejects if audio.play() stays pending (e.g. autoplay policy) instead of
+// hanging the whole read-aloud chain on one page forever.
+async function playAudioWithTimeout(
+  audio: HTMLAudioElement,
+  timeoutMs: number,
+  label: string
+): Promise<void> {
+  let timeoutId = 0;
+  try {
+    await Promise.race([
+      audio.play(),
+      new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(
+          () =>
+            reject(
+              new Error(`${label} did not start playing within ${Math.round(timeoutMs / 1000)} seconds.`)
+            ),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+// Polls audio.currentTime while playback should be alive. If time stops
+// advancing (stalled decode, wedged pipeline) the caller force-advances
+// instead of sitting on one page forever. Returns a cleanup function.
+function watchAudioProgress(
+  audio: HTMLAudioElement,
+  isAlive: () => boolean,
+  onStuck: () => void,
+  stuckMs = 10000,
+  pollMs = 2000
+): () => void {
+  let lastTime = -1;
+  let stuckForMs = 0;
+  const timer = window.setInterval(() => {
+    if (!isAlive() || audio.ended || audio.paused) {
+      window.clearInterval(timer);
+      return;
+    }
+    const currentTime = audio.currentTime;
+    if (currentTime === lastTime) {
+      stuckForMs += pollMs;
+    } else {
+      stuckForMs = 0;
+      lastTime = currentTime;
+    }
+    if (stuckForMs >= stuckMs) {
+      window.clearInterval(timer);
+      onStuck();
+    }
+  }, pollMs);
+  return () => window.clearInterval(timer);
+}
+
+// Generous upper bound for one utterance: ~12 chars/sec + headroom.
+function estimateUtteranceTimeoutMs(text: string): number {
+  return Math.min(120000, Math.max(8000, 5000 + text.length * 90));
 }
 
 function isWebSpeechSupported(): boolean {
@@ -753,33 +1063,83 @@ function isReadableTextNode(node: Node): boolean {
   return computedStyle?.display !== "none" && computedStyle?.visibility !== "hidden";
 }
 
-function isTextNodeInViewport(node: Text, document: Document): boolean {
+interface VisibleBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+// Görünür alan her zaman çağıran tarafından verilir. Foliate her bölümü,
+// bölümün TÜM sütunlarını kaplayan bir iframe'e yerleştirir; iframe'in kendi
+// innerWidth değeri "görünen sayfa" değil, bölümün tamamıdır (ör. 30k
+// karakter). Bu yüzden kırpma, okuyucu alanının (ya da görünmez ön yükleme
+// görünümünün kendi kutusunun) iframe koordinatlarına çevrilmesiyle yapılır.
+// Mümkünse paginator'ın gerçek sayfa kutusu (#container) kullanılır: foliate-view
+// öğesi kenar boşluklarını da kapsadığı için komşu bölümün ilk sütunu kırpmadan
+// sızabiliyordu.
+function getVisibleBounds(view: FoliateViewElement | null): VisibleBounds {
+  if (view) {
+    try {
+      const rendererElement = view.renderer as unknown as HTMLElement | null;
+      const container = rendererElement?.shadowRoot?.getElementById?.("container");
+      if (container) {
+        const containerRect = container.getBoundingClientRect();
+        return {
+          left: containerRect.left,
+          top: containerRect.top,
+          right: containerRect.right,
+          bottom: containerRect.bottom
+        };
+      }
+    } catch {
+      // Eski/mock motor: foliate-view kutusuna düş.
+    }
+
+    const rect = view.getBoundingClientRect();
+    return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+  }
+
+  return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+}
+
+function isTextNodeInViewport(node: Text, document: Document, bounds: VisibleBounds): boolean {
   const view = document.defaultView;
   if (!view) {
     return false;
   }
 
-  const viewportWidth = view.innerWidth || document.documentElement.clientWidth;
-  const viewportHeight = view.innerHeight || document.documentElement.clientHeight;
-  const range = document.createRange();
+  let { left, top, right, bottom } = bounds;
+  const frameElement = view.frameElement as HTMLElement | null;
+  if (frameElement) {
+    const frameRect = frameElement.getBoundingClientRect();
+    left -= frameRect.left;
+    right -= frameRect.left;
+    top -= frameRect.top;
+    bottom -= frameRect.top;
+  }
 
+  const range = document.createRange();
   try {
     range.selectNodeContents(node);
     return Array.from(range.getClientRects()).some(
       (rect) =>
         rect.width > 0 &&
         rect.height > 0 &&
-        rect.right > 0 &&
-        rect.bottom > 0 &&
-        rect.left < viewportWidth &&
-        rect.top < viewportHeight
+        rect.right > left &&
+        rect.bottom > top &&
+        rect.left < right &&
+        rect.top < bottom
     );
   } finally {
     range.detach();
   }
 }
 
-function extractVisibleSpeechText(document: Document): { text: string; languageHint: string } {
+function extractVisibleSpeechText(
+  document: Document,
+  bounds: VisibleBounds
+): { text: string; languageHint: string } {
   const body = document.body;
   if (!body) {
     return { text: "", languageHint: normalizeLanguageTag(document.documentElement.lang) };
@@ -787,7 +1147,7 @@ function extractVisibleSpeechText(document: Document): { text: string; languageH
 
   const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      if (!isReadableTextNode(node) || !isTextNodeInViewport(node as Text, document)) {
+      if (!isReadableTextNode(node) || !isTextNodeInViewport(node as Text, document, bounds)) {
         return NodeFilter.FILTER_REJECT;
       }
 
@@ -815,83 +1175,56 @@ function extractVisibleSpeechText(document: Document): { text: string; languageH
     languageHint
   };
 }
-
-function getElementFromNode(node: Node): Element | null {
-  return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
-}
-
-function extractLocationSpeechText(rendition: Rendition, location: Location | null): { text: string; languageHint: string } {
-  const startCfi = location?.start?.cfi;
-  const endCfi = location?.end?.cfi;
-  if (!startCfi || !endCfi) {
+function snapshotFromRange(range: Range | null): { text: string; languageHint: string } {
+  if (!range) {
     return { text: "", languageHint: "" };
   }
 
   try {
-    const startRange = rendition.getRange(startCfi);
-    const endRange = rendition.getRange(endCfi);
-    const startDocument = startRange.startContainer.ownerDocument;
-    const endDocument = endRange.endContainer.ownerDocument;
-
-    if (!startDocument || startDocument !== endDocument) {
-      return { text: "", languageHint: "" };
-    }
-
-    const pageRange = startDocument.createRange();
-    try {
-      pageRange.setStart(startRange.startContainer, startRange.startOffset);
-      pageRange.setEnd(endRange.endContainer, endRange.endOffset);
-    } catch {
-      pageRange.detach();
-      return { text: "", languageHint: "" };
-    }
-
-    const languageHint = getLanguageHintFromElement(getElementFromNode(pageRange.commonAncestorContainer));
-    const text = normalizeWhitespace(pageRange.cloneContents().textContent || "");
-    pageRange.detach();
-
-    return { text, languageHint };
+    const ancestor = range.commonAncestorContainer;
+    const element =
+      ancestor.nodeType === Node.ELEMENT_NODE ? (ancestor as Element) : ancestor.parentElement;
+    return {
+      text: normalizeWhitespace(range.toString() || ""),
+      languageHint: getLanguageHintFromElement(element)
+    };
   } catch {
     return { text: "", languageHint: "" };
   }
 }
 
-function getLocationSpeechKey(location: Location | null): string {
-  const start = location?.start;
-  if (!start) {
-    return "";
-  }
-
-  return [start.href || "", start.displayed?.page || "", start.displayed?.total || "", start.cfi || ""].join(":");
-}
-
-function createVisibleSpeechSnapshot(rendition: Rendition, location: Location | null): VisibleSpeechSnapshot {
-  if (location) {
-    const locationText = extractLocationSpeechText(rendition, location);
-    if (!locationText.text) {
-      const sections = getRenditionContents(rendition).map((contents) => extractVisibleSpeechText(contents.document));
-      return {
-        text: normalizeWhitespace(sections.map((section) => section.text).filter(Boolean).join("\n\n")),
-        languageHint: sections.find((section) => section.languageHint)?.languageHint || locationText.languageHint,
-        pageKey: getLocationSpeechKey(location)
-      };
-    }
-
-    return {
-      text: locationText.text,
-      languageHint: locationText.languageHint,
-      pageKey: getLocationSpeechKey(location)
-    };
-  }
-
-  const sections = getRenditionContents(rendition).map((contents) => extractVisibleSpeechText(contents.document));
-  const languageHint = sections.find((section) => section.languageHint)?.languageHint || "";
-
+function snapshotFromDocuments(
+  documents: Document[],
+  pageKey: string,
+  bounds: VisibleBounds
+): VisibleSpeechSnapshot {
+  const sections = documents.map((document) => extractVisibleSpeechText(document, bounds));
   return {
     text: normalizeWhitespace(sections.map((section) => section.text).filter(Boolean).join("\n\n")),
-    languageHint,
-    pageKey: getLocationSpeechKey(location)
+    languageHint: sections.find((section) => section.languageHint)?.languageHint || "",
+    pageKey
   };
+}
+
+function createVisibleSpeechSnapshot(
+  view: FoliateViewElement | null,
+  detail: FoliateRelocateDetail | null
+): VisibleSpeechSnapshot {
+  const pageKey = detail?.cfi || "";
+  if (detail?.range) {
+    const text = snapshotFromRange(detail.range);
+    if (text.text) {
+      return { ...text, pageKey };
+    }
+  }
+
+  let documents: Document[] = [];
+  try {
+    documents = (view?.renderer.getContents() || []).map((contents) => contents.doc);
+  } catch {
+    documents = [];
+  }
+  return snapshotFromDocuments(documents, pageKey, getVisibleBounds(view));
 }
 
 function selectVoiceForLanguage(language: string, voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
@@ -1018,8 +1351,15 @@ function splitDeepgramPageText(text: string): string[] {
   return normalizedText ? [normalizedText] : [];
 }
 
-function usePersistentState<T>(key: string, fallback: T): PersistentState<T> {
-  const [value, setValue] = useState(() => readJson(key, fallback));
+function usePersistentState<T>(
+  key: string,
+  fallback: T,
+  normalize?: (value: T) => T
+): PersistentState<T> {
+  const [value, setValue] = useState<T>(() => {
+    const stored = readJson(key, fallback);
+    return normalize ? normalize(stored) : stored;
+  });
 
   useEffect(() => {
     writeJson(key, value);
@@ -1031,11 +1371,17 @@ function usePersistentState<T>(key: string, fallback: T): PersistentState<T> {
 function App() {
   const queryBookUrl = useMemo(() => getQueryBookUrl(), []);
   const [library, setLibrary] = usePersistentState<LibraryBook[]>(LIBRARY_KEY, []);
-  const [settings, setSettings] = usePersistentState<ReaderSettings>(SETTINGS_KEY, defaultSettings);
+  const [settings, setSettings] = usePersistentState<ReaderSettings>(
+    SETTINGS_KEY,
+    defaultSettings,
+    normalizeSettings
+  );
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
-  const [isToolbarOpen, setIsToolbarOpen] = useState(false);
-  const [isLibraryOpen, setIsLibraryOpen] = useState(false);
-  const [isAddOpen, setIsAddOpen] = useState(!queryBookUrl);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(() =>
+    typeof window === "undefined" ? true : window.innerWidth >= 1024
+  );
+  const [isSidebarPinned, setIsSidebarPinned] = useState(true);
+  const [isAddOpen, setIsAddOpen] = useState(false);
   const [urlInput, setUrlInput] = useState("");
   const [addDialogError, setAddDialogError] = useState("");
   const [isUploadingBook, setIsUploadingBook] = useState(false);
@@ -1050,16 +1396,23 @@ function App() {
   const [areLocationsReady, setAreLocationsReady] = useState(false);
   const viewerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const bookRef = useRef<Book | null>(null);
-  const renditionRef = useRef<Rendition | null>(null);
-  const deepgramCacheBookRef = useRef<Book | null>(null);
-  const deepgramCacheRenditionRef = useRef<Rendition | null>(null);
+  const viewRef = useRef<FoliateViewElement | null>(null);
+  const hiddenViewRef = useRef<FoliateViewElement | null>(null);
   const deepgramCacheContainerRef = useRef<HTMLDivElement | null>(null);
   const activeBookRef = useRef<LibraryBook | null>(null);
   const pendingAddedBookIdsRef = useRef<Set<string>>(new Set());
   const settingsRef = useRef(settings);
   const queryBookHandledRef = useRef(false);
-  const lastLocationRef = useRef<Location | null>(null);
+  const lastLocationRef = useRef<ReaderLoc | null>(null);
+  const lastDetailRef = useRef<FoliateRelocateDetail | null>(null);
+  // Gerçek sayfa sayısı: bölüm başına yeniden akıtılmış sayfa tablosu.
+  const pageCounterContainerRef = useRef<HTMLDivElement | null>(null);
+  const pageCounterViewRef = useRef<FoliateViewElement | null>(null);
+  const pageTableRef = useRef<PageTable | null>(null);
+  const bookInputRef = useRef<string | File | null>(null);
+  const pageCountGenerationRef = useRef(0);
+  const [pageCountProgress, setPageCountProgress] = useState<{ done: number; total: number } | null>(null);
+  const hiddenDetailRef = useRef<FoliateRelocateDetail | null>(null);
   const speechChunksRef = useRef<string[]>([]);
   const speechChunkIndexRef = useRef(0);
   const speechProviderRef = useRef<SpeechProvider>(settings.speechProvider || DEFAULT_SPEECH_PROVIDER);
@@ -1072,6 +1425,10 @@ function App() {
   const speechPausedRef = useRef(false);
   const speechTokenRef = useRef(0);
   const speechPageAdvanceInFlightRef = useRef(false);
+  const speechAdvanceRetryRef = useRef(0);
+  // "primaryIndex:page" of the page being read aloud. Updated every time a
+  // page starts; see the note in handleRelocate about why CFI is not used.
+  const speechPageSignatureRef = useRef("");
   const speechPageTurnCleanupRef = useRef<(() => void) | null>(null);
   const deepgramAudioRef = useRef<HTMLAudioElement | null>(null);
   const piperAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -1102,6 +1459,9 @@ function App() {
   const manualPageNavigationInFlightRef = useRef(false);
   const pageNavigationOriginRef = useRef<"speech" | "manual" | null>(null);
   const pendingManualPageDirectionRef = useRef<"previous" | "next" | null>(null);
+  // Bekleyen elle çevirme sayısı (işaretli: +1 ileri, -1 geri). Tek bir yön
+  // yerine net sayaç tutulur; hızlı basışta tek çevirme "yutulmaz".
+  const pendingManualTurnsRef = useRef(0);
   const manualPageNavigationGenerationRef = useRef(0);
 
   const activeBook = useMemo(
@@ -1119,6 +1479,13 @@ function App() {
 
   useEffect(() => {
     settingsRef.current = settings;
+    const themeName = settings.themeName || "default";
+    const mode = settings.theme === "light" ? "light" : "dark";
+    const dataTheme = `${themeName}-${mode}`;
+    document.documentElement.setAttribute("data-theme", dataTheme);
+    document.documentElement.setAttribute("data-page", "reader");
+    // Remove a value left by older versions that offered an e-ink mode.
+    document.documentElement.removeAttribute("data-eink");
     const nextProvider = settings.speechProvider || DEFAULT_SPEECH_PROVIDER;
     const storedLanguage = settings.speechLanguage || DEFAULT_SPEECH_LANGUAGE;
     const nextLanguage =
@@ -1155,10 +1522,12 @@ function App() {
       settings.speechLanguage !== nextLanguage ||
       settings.deepgramModel !== nextDeepgramModel ||
       settings.piperVoice !== nextPiperVoice ||
-      settings.emaVoice !== nextEmaVoice
+      settings.emaVoice !== nextEmaVoice ||
+      !settings.themeName
     ) {
       setSettings((currentSettings) => ({
         ...currentSettings,
+        themeName: currentSettings.themeName || "default",
         speechProvider: nextProvider,
         speechLanguage: nextLanguage,
         deepgramModel: nextDeepgramModel,
@@ -1166,7 +1535,34 @@ function App() {
         emaVoice: nextEmaVoice
       }));
     }
-  }, [settings]);
+  }, [settings, setSettings]);
+
+  // Arka planda konuşma yok: sekme gizlenince sesi durdur. Web Speech
+  // duraklatılabilir (kullanıcı dönünce devam eder); ağ üzerinden gelen
+  // sesler (Deepgram/Piper/Ema) tamamen durdurulur.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "hidden" || !speechShouldContinueRef.current) {
+        return;
+      }
+      if (speechProviderRef.current === "web-speech") {
+        speechPausedRef.current = true;
+        try {
+          if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+            window.speechSynthesis.pause();
+          }
+        } catch {
+          // Duraklatma best-effort; bayrak yine de parça akışını durdurur.
+        }
+        setSpeechMode("paused");
+        void releaseSpeechWakeLock();
+      } else {
+        stopSpeech();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, []);
 
   useEffect(() => {
     const preventZoomKeys = (event: KeyboardEvent) => {
@@ -1285,6 +1681,14 @@ function App() {
 
         const controller = new AbortController();
         deepgramAbortControllersRef.current.add(controller);
+        // A hung request must surface as an error, not a silent eternal
+        // "loading" state with no page turn. User-initiated aborts still
+        // produce AbortError and stay silent.
+        let requestTimedOut = false;
+        const requestTimeoutId = window.setTimeout(() => {
+          requestTimedOut = true;
+          controller.abort();
+        }, DEEPGRAM_REQUEST_TIMEOUT_MS);
 
         try {
           const model = deepgramModelRef.current || getDefaultDeepgramModel(speechLanguageRef.current);
@@ -1318,8 +1722,15 @@ function App() {
           if (generation === deepgramCacheGenerationRef.current) {
             deepgramAudioCacheRef.current.delete(task.cacheKey);
           }
-          task.reject(error);
+          task.reject(
+            requestTimedOut
+              ? new Error(
+                  `Deepgram speech request timed out after ${Math.round(DEEPGRAM_REQUEST_TIMEOUT_MS / 1000)} seconds. Check your connection and try again.`
+                )
+              : error
+          );
         } finally {
+          window.clearTimeout(requestTimeoutId);
           deepgramAbortControllersRef.current.delete(controller);
         }
       }
@@ -1591,6 +2002,7 @@ function App() {
     speechChunksRef.current = [];
     speechChunkIndexRef.current = 0;
     speechPageKeyRef.current = "";
+    speechPageSignatureRef.current = "";
     deepgramProgressiveStateRef.current = {
       sentenceCount: 0,
       groupIndex: 0,
@@ -1636,11 +2048,11 @@ function App() {
     stopSpeech();
   }
 
-  function getCurrentSpeechLocation(): Location | null {
-    return lastLocationRef.current || renditionRef.current?.location || null;
+  function getCurrentSpeechLocation(): ReaderLoc | null {
+    return lastLocationRef.current;
   }
 
-  function moveToNextSpeechPage(rendition: Rendition, previousPageKey: string): Promise<Location | null> {
+  function moveToNextSpeechPage(view: FoliateViewElement, previousPageKey: string): Promise<ReaderLoc | null> {
     clearSpeechPageTurnWait();
 
     return new Promise((resolve, reject) => {
@@ -1652,12 +2064,12 @@ function App() {
           window.clearTimeout(timeoutId);
           timeoutId = null;
         }
-        rendition.off("relocated", handleRelocated);
+        view.removeEventListener("relocate", handleRelocated);
         if (speechPageTurnCleanupRef.current === cleanup) {
           speechPageTurnCleanupRef.current = null;
         }
       };
-      const finish = (location: Location | null) => {
+      const finish = (location: ReaderLoc | null) => {
         if (settled) {
           return;
         }
@@ -1673,25 +2085,26 @@ function App() {
         cleanup();
         reject(error);
       };
-      const hasPageChanged = (location: Location | null) =>
+      const hasPageChanged = (location: ReaderLoc | null) =>
         Boolean(location && (location.atEnd || getLocationSpeechKey(location) !== previousPageKey));
-      const handleRelocated = (location: Location) => {
+      const handleRelocated = (event: Event) => {
+        const location = toReaderLoc((event as CustomEvent<FoliateRelocateDetail>).detail);
         if (hasPageChanged(location)) {
           finish(location);
         }
       };
 
       speechPageTurnCleanupRef.current = cleanup;
-      rendition.on("relocated", handleRelocated);
+      view.addEventListener("relocate", handleRelocated);
       timeoutId = window.setTimeout(() => {
-        const location = lastLocationRef.current || rendition.location || null;
+        const location = lastLocationRef.current;
         finish(hasPageChanged(location) ? location : null);
       }, SPEECH_PAGE_TURN_TIMEOUT_MS);
 
-      rendition
+      view
         .next()
         .then(() => {
-          const location = lastLocationRef.current || rendition.location || null;
+          const location = lastLocationRef.current;
           if (hasPageChanged(location)) {
             finish(location);
           }
@@ -1700,23 +2113,48 @@ function App() {
     });
   }
 
+  // Elle çevirme sürerken konuşma sayfa takibi için kısa aralıklarla tekrar
+// dener (sınırlı sayıda; sonsuz döngüye girmesin).
+function scheduleSpeechPageAdvance(): void {
+    if (speechAdvanceRetryRef.current >= MAX_SPEECH_ADVANCE_RETRIES) {
+      return;
+    }
+    speechAdvanceRetryRef.current += 1;
+    window.setTimeout(() => {
+      if (!speechShouldContinueRef.current || isSpeechPaused()) {
+        return;
+      }
+      advanceAfterSpeechPage();
+    }, SPEECH_ADVANCE_RETRY_MS);
+  }
+
   function advanceAfterSpeechPage(): void {
-    const rendition = renditionRef.current;
+    const view = viewRef.current;
     const currentLocation = getCurrentSpeechLocation();
     const completedPageKey = speechPageKeyRef.current;
+
+    if (!view || currentLocation?.atEnd) {
+      stopSpeech("idle");
+      return;
+    }
+    // Bu iki kontrol, önbellek/ilerleme durumuna dokunmadan önce yapılır:
+    // aksi hâlde yeniden denemede aynı sayfa iki kez silinir.
+    if (speechPageAdvanceInFlightRef.current) {
+      return;
+    }
+    if (manualPageNavigationInFlightRef.current) {
+      // Elle çevirme sürüyorsa bekle ve sonra tekrar dene. Önceden sessizce
+      // dönmek, konuşma biten sayfadan sonra hiç çevirme yapılmamasına ve
+      // okumanın o sayfada kilitlenmesine yol açıyordu.
+      scheduleSpeechPageAdvance();
+      return;
+    }
+
     const completedDeepgramPage = deepgramCachePagesRef.current.get(completedPageKey);
     if (speechProviderRef.current === "deepgram" && completedDeepgramPage) {
       deepgramProgressiveStateRef.current = completedDeepgramPage.nextProgressiveState;
     }
     deepgramCachePagesRef.current.delete(completedPageKey);
-    if (!rendition || currentLocation?.atEnd) {
-      stopSpeech("idle");
-      return;
-    }
-
-    if (speechPageAdvanceInFlightRef.current || manualPageNavigationInFlightRef.current) {
-      return;
-    }
 
     const token = speechTokenRef.current;
     const navigationGeneration = manualPageNavigationGenerationRef.current;
@@ -1725,10 +2163,10 @@ function App() {
     pageNavigationOriginRef.current = "speech";
     clearSpeechPageTurnWait();
 
-    void moveToNextSpeechPage(rendition, completedPageKey)
+    void moveToNextSpeechPage(view, completedPageKey)
       .then((location) => {
         speechPageAdvanceInFlightRef.current = false;
-        finishPageNavigation(rendition, navigationGeneration);
+        finishPageNavigation(view, navigationGeneration);
         if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
           return;
         }
@@ -1741,11 +2179,12 @@ function App() {
           return;
         }
 
+        speechAdvanceRetryRef.current = 0;
         startSpeechForCurrentPage(location, completedPageKey);
       })
       .catch((error) => {
         speechPageAdvanceInFlightRef.current = false;
-        finishPageNavigation(rendition, navigationGeneration);
+        finishPageNavigation(view, navigationGeneration);
         if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
           return;
         }
@@ -1763,6 +2202,7 @@ function App() {
 
     const chunks = speechChunksRef.current;
     if (chunks.length === 0) {
+      setSpeechError("There is no readable text on this page.");
       setSpeechMode("error");
       return;
     }
@@ -1772,6 +2212,9 @@ function App() {
     speechChunkIndexRef.current = startIndex;
     clearSpeechPageTurnWait();
     void requestSpeechWakeLock();
+
+    // Chunks that already needed a watchdog retry in this page session.
+    const retriedChunks = new Set<number>();
 
     const speakAt = (index: number) => {
       if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
@@ -1789,7 +2232,18 @@ function App() {
         utterance.voice = speechVoiceRef.current;
       }
 
+      let utteranceSettled = false;
+      let watchdogId = 0;
+      const clearUtteranceWatchdog = () => {
+        utteranceSettled = true;
+        if (watchdogId) {
+          window.clearTimeout(watchdogId);
+          watchdogId = 0;
+        }
+      };
+
       utterance.onend = () => {
+        clearUtteranceWatchdog();
         if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
           return;
         }
@@ -1799,71 +2253,124 @@ function App() {
       };
 
       utterance.onerror = (event) => {
+        clearUtteranceWatchdog();
         if (token !== speechTokenRef.current || event.error === "interrupted" || event.error === "canceled") {
           return;
         }
 
+        setSpeechError("The browser speech engine reported an error. Play was stopped.");
         stopSpeech("error");
       };
+
+      // The engine sometimes swallows an utterance entirely (no end, no
+      // error, "speaking" forever) — the classic stuck-on-one-page. Retry
+      // once, then fail loudly instead of hanging silently. Boundary events
+      // prove the utterance is alive, so they re-arm the timer.
+      const armWatchdog = () => {
+        if (watchdogId) {
+          window.clearTimeout(watchdogId);
+        }
+        watchdogId = window.setTimeout(() => {
+          if (utteranceSettled || token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+            return;
+          }
+          try {
+            window.speechSynthesis.cancel();
+          } catch {
+            // Engine already wedged; the retry/stop below still runs.
+          }
+          if (!retriedChunks.has(index)) {
+            retriedChunks.add(index);
+            window.setTimeout(() => {
+              if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
+                return;
+              }
+              speakAt(index);
+            }, 200);
+          } else {
+            setSpeechError("The browser speech engine stopped responding. Play was stopped.");
+            stopSpeech("error");
+          }
+        }, estimateUtteranceTimeoutMs(chunks[index]));
+      };
+      utterance.onboundary = () => {
+        if (!utteranceSettled && token === speechTokenRef.current && speechShouldContinueRef.current) {
+          armWatchdog();
+        }
+      };
+      armWatchdog();
 
       setSpeechMode("playing");
       window.speechSynthesis.speak(utterance);
     };
 
     window.speechSynthesis.cancel();
-    speakAt(startIndex);
+    // Speak-after-cancel in the same task is dropped by Chrome often enough
+    // to matter; a short delay makes the start reliable.
+    window.setTimeout(() => {
+      if (token !== speechTokenRef.current || !speechShouldContinueRef.current || isSpeechPaused()) {
+        return;
+      }
+      speakAt(startIndex);
+    }, WEB_SPEECH_START_DELAY_MS);
   }
 
-  function moveDeepgramCacheRendition(action: () => Promise<void>): Promise<Location | null> {
-    const cacheRendition = deepgramCacheRenditionRef.current;
-    if (!cacheRendition) {
-      return Promise.resolve(null);
+  function moveHiddenViewAndWait(action: () => Promise<unknown>): Promise<FoliateRelocateDetail | null> {
+    const hiddenView = hiddenViewRef.current;
+    if (!hiddenView) {
+      return Promise.resolve(hiddenDetailRef.current);
     }
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
+      let settled = false;
       const timeout = window.setTimeout(() => {
-        cacheRendition.off("relocated", handleRelocated);
-        resolve(cacheRendition.location || null);
-      }, 2500);
-      const handleRelocated = (location: Location) => {
+        done(hiddenDetailRef.current);
+      }, SPEECH_PAGE_TURN_TIMEOUT_MS);
+      const done = (detail: FoliateRelocateDetail | null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         window.clearTimeout(timeout);
-        cacheRendition.off("relocated", handleRelocated);
-        resolve(location);
+        hiddenView.removeEventListener("relocate", handleRelocated);
+        resolve(detail);
+      };
+      const handleRelocated = (event: Event) => {
+        done((event as CustomEvent<FoliateRelocateDetail>).detail || null);
       };
 
-      cacheRendition.on("relocated", handleRelocated);
-      action().catch((error) => {
-        window.clearTimeout(timeout);
-        cacheRendition.off("relocated", handleRelocated);
-        reject(error);
+      hiddenView.addEventListener("relocate", handleRelocated);
+      action().catch(() => {
+        done(hiddenDetailRef.current);
       });
     });
   }
 
   async function cacheDeepgramCurrentAndNextPages(
     currentPage: DeepgramCachedPage,
-    currentLocation: Location | null,
+    currentLocation: ReaderLoc | null,
     token: number,
     currentStartIndex = 1
   ): Promise<void> {
     cacheDeepgramPage(currentPage, currentStartIndex);
 
-    const cacheRendition = deepgramCacheRenditionRef.current;
-    const startCfi = currentLocation?.start?.cfi;
-    if (!cacheRendition || !startCfi) {
+    const hiddenView = hiddenViewRef.current;
+    const startCfi = currentLocation?.cfi;
+    if (!hiddenView || !startCfi) {
       return;
     }
 
     try {
-      let location = await moveDeepgramCacheRendition(() => cacheRendition.display(startCfi));
+      let detail = await moveHiddenViewAndWait(() => hiddenView.goTo(startCfi));
       let progressiveState = currentPage.nextProgressiveState;
       for (let pageOffset = 1; pageOffset < DEEPGRAM_CACHED_PAGE_COUNT; pageOffset += 1) {
-        if (token !== speechTokenRef.current || !speechShouldContinueRef.current || location?.atEnd) {
+        const currentLoc = detail ? toReaderLoc(detail) : null;
+        if (token !== speechTokenRef.current || !speechShouldContinueRef.current || !detail || currentLoc?.atEnd) {
           return;
         }
 
-        location = await moveDeepgramCacheRendition(() => cacheRendition.next());
-        const snapshot = createVisibleSpeechSnapshot(cacheRendition, location);
+        detail = await moveHiddenViewAndWait(() => hiddenView.next());
+        const snapshot = createVisibleSpeechSnapshot(hiddenView, detail);
         if (!snapshot.text || !snapshot.pageKey || snapshot.pageKey === currentPage.pageKey) {
           continue;
         }
@@ -1880,6 +2387,7 @@ function App() {
   function speakDeepgramChunks(startIndex = 0): void {
     const chunks = speechChunksRef.current;
     if (chunks.length === 0) {
+      setSpeechError("There is no readable text on this page.");
       setSpeechMode("error");
       return;
     }
@@ -1921,7 +2429,10 @@ function App() {
         audio.muted = false;
         deepgramAudioRef.current = audio;
 
+        let stopAudioWatch: (() => void) | null = null;
         const releaseCompletedAudio = () => {
+          stopAudioWatch?.();
+          stopAudioWatch = null;
           audio.onended = null;
           audio.onerror = null;
           deepgramAudioCacheRef.current.delete(getDeepgramAudioCacheKey(pageKey, index));
@@ -1956,7 +2467,21 @@ function App() {
         audio.src = audioUrl;
         audio.load();
         setSpeechMode("playing");
-        await audio.play();
+        await playAudioWithTimeout(audio, SPEECH_AUDIO_PLAY_TIMEOUT_MS, "Deepgram audio");
+        // If 'ended' never fires (stalled decode), force-advance instead of
+        // sitting on one page forever.
+        stopAudioWatch = watchAudioProgress(
+          audio,
+          () => token === speechTokenRef.current && speechShouldContinueRef.current,
+          () => {
+            releaseCompletedAudio();
+            if (token !== speechTokenRef.current || !speechShouldContinueRef.current) {
+              return;
+            }
+            speechChunkIndexRef.current = index + 1;
+            void playAt(index + 1);
+          }
+        );
         if (index === startIndex) {
           void cacheDeepgramCurrentAndNextPages(currentPage, getCurrentSpeechLocation(), token, index + 1);
         }
@@ -1977,6 +2502,7 @@ function App() {
   function speakPiperChunks(startIndex = 0): void {
     const chunks = speechChunksRef.current;
     if (chunks.length === 0) {
+      setSpeechError("There is no readable text on this page.");
       setSpeechMode("error");
       return;
     }
@@ -2048,7 +2574,7 @@ function App() {
         audio.src = audioUrl;
         audio.load();
         setSpeechMode("playing");
-        await audio.play();
+        await playAudioWithTimeout(audio, SPEECH_AUDIO_PLAY_TIMEOUT_MS, "Piper audio");
       } catch (error) {
         if ((error instanceof DOMException && error.name === "AbortError") || token !== speechTokenRef.current) {
           return;
@@ -2066,6 +2592,7 @@ function App() {
   function speakEmaChunks(startIndex = 0): void {
     const chunks = speechChunksRef.current;
     if (chunks.length === 0) {
+      setSpeechError("There is no readable text on this page.");
       setSpeechMode("error");
       return;
     }
@@ -2137,7 +2664,7 @@ function App() {
         audio.src = audioUrl;
         audio.load();
         setSpeechMode("playing");
-        await audio.play();
+        await playAudioWithTimeout(audio, SPEECH_AUDIO_PLAY_TIMEOUT_MS, "Ema audio");
       } catch (error) {
         if ((error instanceof DOMException && error.name === "AbortError") || token !== speechTokenRef.current) {
           return;
@@ -2172,23 +2699,25 @@ function App() {
   }
 
   function startSpeechForCurrentPage(
-    location: Location | null = getCurrentSpeechLocation(),
+    location: ReaderLoc | null = getCurrentSpeechLocation(),
     previousPageKey = ""
   ): void {
-    const rendition = renditionRef.current;
-    if (!rendition) {
+    const view = viewRef.current;
+    if (!view) {
       stopSpeech("idle");
       return;
     }
 
-    const snapshot = createVisibleSpeechSnapshot(rendition, location);
-    if (previousPageKey && (!snapshot.pageKey || snapshot.pageKey === previousPageKey)) {
+    const snapshot = createVisibleSpeechSnapshot(view, lastDetailRef.current);
+    const pageKey = snapshot.pageKey || getLocationSpeechKey(location);
+    if (previousPageKey && (!pageKey || pageKey === previousPageKey)) {
       setSpeechError("The reader did not finish changing pages.");
       stopSpeech("error");
       return;
     }
 
-    speechPageKeyRef.current = snapshot.pageKey;
+    speechPageKeyRef.current = pageKey;
+    speechPageSignatureRef.current = getRendererSignature(view);
     if (!snapshot.text) {
       if (location?.atEnd) {
         stopSpeech("idle");
@@ -2201,9 +2730,9 @@ function App() {
 
     if (speechProviderRef.current === "deepgram") {
       const page =
-        deepgramCachePagesRef.current.get(snapshot.pageKey) ||
-        createDeepgramCachedPage(snapshot.pageKey, snapshot.text, deepgramProgressiveStateRef.current);
-      deepgramCachePagesRef.current.set(snapshot.pageKey, page);
+        deepgramCachePagesRef.current.get(pageKey) ||
+        createDeepgramCachedPage(pageKey, snapshot.text, deepgramProgressiveStateRef.current);
+      deepgramCachePagesRef.current.set(pageKey, page);
       speechChunksRef.current = page.chunks;
     } else {
       speechChunksRef.current = splitSpeechText(snapshot.text);
@@ -2227,7 +2756,15 @@ function App() {
     if (speechMode === "playing") {
       if (provider === "web-speech") {
         speechPausedRef.current = true;
-        window.speechSynthesis.pause();
+        // pause() on an idle engine wedges Chrome's queue; only pause while
+        // something is actually being spoken.
+        try {
+          if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+            window.speechSynthesis.pause();
+          }
+        } catch {
+          // Pausing is best-effort; the paused flag still stops chunk flow.
+        }
         setSpeechMode("paused");
         void releaseSpeechWakeLock();
         return;
@@ -2241,7 +2778,22 @@ function App() {
       if (provider === "web-speech") {
         speechShouldContinueRef.current = true;
         speechPausedRef.current = false;
-        window.speechSynthesis.resume();
+        if (window.speechSynthesis.paused) {
+          try {
+            window.speechSynthesis.resume();
+          } catch {
+            // A wedged engine ignores resume(); restart below instead.
+            window.speechSynthesis.cancel();
+            speakSpeechChunks(speechChunkIndexRef.current);
+            return;
+          }
+        } else {
+          // Not paused but mode says paused: the engine is wedged. Restart
+          // the current chunk instead of resuming into the wedge.
+          window.speechSynthesis.cancel();
+          speakSpeechChunks(speechChunkIndexRef.current);
+          return;
+        }
         setSpeechMode("playing");
         void requestSpeechWakeLock();
         return;
@@ -2251,8 +2803,8 @@ function App() {
     }
 
     const activeBookForSpeech = activeBookRef.current;
-    const rendition = renditionRef.current;
-    if (!activeBookForSpeech || !rendition || readerStatus !== "ready") {
+    const view = viewRef.current;
+    if (!activeBookForSpeech || !view || readerStatus !== "ready") {
       return;
     }
 
@@ -2286,9 +2838,17 @@ function App() {
     }
 
     const currentLocation = getCurrentSpeechLocation();
-    const currentSnapshot = createVisibleSpeechSnapshot(rendition, currentLocation);
+    const currentSnapshot = createVisibleSpeechSnapshot(view, lastDetailRef.current);
     if (!currentSnapshot.text) {
-      stopSpeech("error");
+      if (currentLocation?.atEnd) {
+        stopSpeech("idle");
+        return;
+      }
+      // Görünen sayfada okunacak metin yok (ör. yalnızca kapak görseli):
+      // hata vermek yerine sonraki metinli sayfadan başla.
+      speechPageKeyRef.current = currentSnapshot.pageKey || getLocationSpeechKey(currentLocation);
+      speechPageSignatureRef.current = getRendererSignature(view);
+      advanceAfterSpeechPage();
       return;
     }
 
@@ -2312,6 +2872,7 @@ function App() {
     }
     speechChunkIndexRef.current = 0;
     speechPageKeyRef.current = currentPageKey;
+    speechPageSignatureRef.current = getRendererSignature(view);
     speakSpeechChunks(0);
   }
 
@@ -2336,7 +2897,6 @@ function App() {
     if (openBook) {
       setActiveBookId(existingId);
       setIsAddOpen(false);
-      setIsLibraryOpen(false);
     }
 
     return existingId;
@@ -2375,7 +2935,6 @@ function App() {
     if (openBook) {
       setActiveBookId(uploadedBook.id);
       setIsAddOpen(false);
-      setIsLibraryOpen(false);
     }
 
     return uploadedBook.id;
@@ -2428,24 +2987,107 @@ function App() {
   }, [activeBookId, library, queryBookUrl, upsertBook]);
 
   useEffect(() => {
-    const rendition = renditionRef.current;
-    if (rendition) {
-      applyReaderPreferences(rendition, settings);
-    }
-
-    const cacheRendition = deepgramCacheRenditionRef.current;
-    if (cacheRendition) {
-      cacheRendition.themes.fontSize(`${settings.fontSize}%`);
-      getRenditionContents(cacheRendition).forEach((contents) => applyContentStyles(contents, settings));
+    // Readest: ayar değişince stil + düzen nitelikleri yeniden uygulanır.
+    for (const view of [viewRef.current, hiddenViewRef.current]) {
+      applyFoliateStyles(view, settings);
+      applyFoliateLayout(view, settings);
+      if (view) {
+        for (const { doc } of view.renderer.getContents?.() ?? []) {
+          applyThemeModeClass(doc, settings.theme !== "light");
+        }
+      }
     }
   }, [settings]);
+
+  // Gerçek sayfa tablosunu (bölüm başına yeniden akıtılmış sayfa sayısı)
+  // arka planda hesaplar. Konum (location) sayacı fonta göre değişmediği
+  // için footer'daki "N / M" değerini bu tablo belirler.
+  const refreshRealPage = useCallback(() => {
+    const view = viewRef.current;
+    const table = pageTableRef.current;
+    if (!view || !table) {
+      return;
+    }
+    const total = totalRealPages(table);
+    const page = currentPageNumber(view.renderer as unknown as PageCounterRenderer, table);
+    if (page == null || total <= 0) {
+      return;
+    }
+    setProgress((current) =>
+      current ? { ...current, page, totalPages: total } : current
+    );
+  }, []);
+
+  useEffect(() => {
+    if (readerStatus !== "ready" || !activeBook) {
+      return undefined;
+    }
+    const container = pageCounterContainerRef.current;
+    const viewer = viewerRef.current;
+    const input = bookInputRef.current;
+    if (!container || !viewer || !input) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        destroyFoliateView(pageCounterViewRef.current);
+        pageCounterViewRef.current = null;
+        container.replaceChildren();
+        // Sayaç görünür okuyucuyla birebir aynı boyutta olmalı; sayfa sayısı
+        // sütun genişliğine bağlıdır.
+        const rect = viewer.getBoundingClientRect();
+        container.style.width = `${Math.max(1, Math.round(rect.width))}px`;
+        container.style.height = `${Math.max(1, Math.round(rect.height))}px`;
+
+        const counterView = document.createElement(
+          "foliate-view"
+        ) as unknown as FoliateViewElement;
+        container.append(counterView);
+        pageCounterViewRef.current = counterView;
+        applyFoliateLayout(counterView, settingsRef.current);
+        try {
+          await withTimeout(counterView.open(input), EPUB_OPEN_TIMEOUT_MS, "Page counting timed out.");
+          applyFoliateLayout(counterView, settingsRef.current);
+          applyFoliateStyles(counterView, settingsRef.current);
+          const table = await buildPageTable(
+            counterView as unknown as Parameters<typeof buildPageTable>[0],
+            () => !cancelled,
+            (done, total) => setPageCountProgress({ done, total })
+          );
+          if (cancelled) {
+            return;
+          }
+          pageTableRef.current = table;
+          setPageCountProgress(null);
+          refreshRealPage();
+        } catch {
+          setPageCountProgress(null);
+        }
+      })();
+    }, 600);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      // Yarıda kalan bir sayımın göstergesi ekranda asılı kalmasın.
+      setPageCountProgress(null);
+    };
+  }, [activeBookId, readerStatus, settings, refreshRealPage]);
 
   useEffect(() => {
     if (!activeBook) {
       setBookInfo(null);
       setProgress(null);
       setAreLocationsReady(false);
+      pageTableRef.current = null;
+      setPageCountProgress(null);
       lastLocationRef.current = null;
+      lastDetailRef.current = null;
+      hiddenDetailRef.current = null;
+      viewRef.current = null;
+      hiddenViewRef.current = null;
       viewerRef.current?.replaceChildren();
       deepgramCacheContainerRef.current?.replaceChildren();
       return undefined;
@@ -2458,8 +3100,6 @@ function App() {
     let cancelled = false;
     const container = viewerRef.current;
     const cacheContainer = deepgramCacheContainerRef.current;
-    const previousBook = bookRef.current;
-    const previousCacheBook = deepgramCacheBookRef.current;
 
     setReaderError("");
     setReaderStatus("loading");
@@ -2467,38 +3107,29 @@ function App() {
     setProgress(null);
     setAreLocationsReady(false);
     lastLocationRef.current = null;
+    lastDetailRef.current = null;
+    hiddenDetailRef.current = null;
+    pageTableRef.current = null;
+    setPageCountProgress(null);
     stopSpeech();
     manualPageNavigationGenerationRef.current += 1;
     manualPageNavigationInFlightRef.current = false;
     pageNavigationOriginRef.current = null;
     pendingManualPageDirectionRef.current = null;
+    pendingManualTurnsRef.current = 0;
     container.replaceChildren();
     cacheContainer.replaceChildren();
 
-    if (renditionRef.current) {
-      renditionRef.current.destroy();
-      renditionRef.current = null;
-    }
+    destroyFoliateView(viewRef.current);
+    viewRef.current = null;
+    destroyFoliateView(hiddenViewRef.current);
+    hiddenViewRef.current = null;
 
-    if (previousBook) {
-      previousBook.destroy();
-      bookRef.current = null;
-    }
-    if (deepgramCacheRenditionRef.current) {
-      deepgramCacheRenditionRef.current.destroy();
-      deepgramCacheRenditionRef.current = null;
-    }
-    if (previousCacheBook) {
-      previousCacheBook.destroy();
-      deepgramCacheBookRef.current = null;
-    }
-
-    let openedBook: Book | null = null;
-    let openedCacheBook: Book | null = null;
-    let openedRendition: Rendition | null = null;
-    let openedCacheRendition: Rendition | null = null;
+    let openedView: FoliateViewElement | null = null;
+    let openedHiddenView: FoliateViewElement | null = null;
     let handleKeyDown: ((event: KeyboardEvent) => void) | null = null;
     let openFailed = false;
+    let didRelocate = false;
 
     const failOpen = (message = "This EPUB could not be opened. Check that the file or URL is valid and reachable.") => {
       if (cancelled) {
@@ -2511,191 +3142,239 @@ function App() {
       setReaderError(message);
     };
 
+    const failOpenWithCause = (error: unknown, fallback: string) => {
+      const detail = error instanceof Error && error.message ? `: ${error.message}` : "";
+      failOpen(`${fallback}${detail}`.slice(0, 300));
+    };
+
+    const saveReadingLocation = (detail: FoliateRelocateDetail) => {
+      if (!activeBookRef.current) {
+        return;
+      }
+
+      const { percentage } = getFoliateProgress(detail);
+      // Gerçek, yeniden akıtılmış sayfa sayacı hazırsa onu kullan; hazır değilse
+      // Foliate'in konum (location) tahminine düş.
+      const table = pageTableRef.current;
+      const realTotal = table ? totalRealPages(table) : 0;
+      const realPage = table && openedView ? currentPageNumber(openedView.renderer as unknown as PageCounterRenderer, table) : null;
+      const { page, totalPages } =
+        realPage != null && realTotal > 0
+          ? { page: realPage, totalPages: realTotal }
+          : getFoliateProgress(detail);
+      const currentBookId = activeBookRef.current.id;
+
+      setLibrary((currentLibrary) =>
+        currentLibrary.map((storedBook) =>
+          storedBook.id === currentBookId
+            ? {
+                ...storedBook,
+                updatedAt: new Date().toISOString(),
+                position: {
+                  cfi: detail.cfi,
+                  href: "",
+                  percentage,
+                  isPrecise: percentage != null,
+                  progressMethod: PROGRESS_METHOD,
+                  updatedAt: new Date().toISOString()
+                }
+              }
+            : storedBook
+        )
+      );
+
+      setProgress({ href: "", percentage: percentage ?? null, page, totalPages });
+    };
+
+    const handleRelocate = (event: Event) => {
+      const detail = (event as CustomEvent<FoliateRelocateDetail>).detail;
+      if (!detail || !detail.cfi || viewRef.current !== openedView) {
+        return;
+      }
+
+      didRelocate = true;
+      lastLocationRef.current = toReaderLoc(detail);
+      lastDetailRef.current = detail;
+      setAreLocationsReady(true);
+      // NOTE: compare the visible page signature, NOT the CFI string. The
+      // paginator emits 'relocate' for background work too (adjacent-section
+      // preload, resize re-renders), each time with a freshly computed range
+      // whose CFI string can differ while the visible page is unchanged.
+      // Killing speech on CFI mismatch stopped read-aloud by itself a few
+      // seconds into every page. Real user turns already stop speech
+      // explicitly via resetSpeechForManualPageChange(); this is only a
+      // backstop for programmatic jumps outside an advance.
+      if (
+        speechShouldContinueRef.current &&
+        !speechPageAdvanceInFlightRef.current &&
+        openedView
+      ) {
+        const currentSignature = getRendererSignature(openedView);
+        if (
+          speechPageSignatureRef.current &&
+          currentSignature &&
+          currentSignature !== speechPageSignatureRef.current
+        ) {
+          stopSpeech();
+        }
+      }
+      saveReadingLocation(detail);
+    };
+
+    const handleHiddenRelocate = (event: Event) => {
+      const detail = (event as CustomEvent<FoliateRelocateDetail>).detail;
+      if (detail?.cfi && hiddenViewRef.current === openedHiddenView) {
+        hiddenDetailRef.current = detail;
+      }
+    };
+
+    // Readest: FoliateViewer.docLoadHandler — belge yüklenince çalışan düzeltmeler.
+    const handleDocLoad = (event: Event) => {
+      const doc = (event as CustomEvent<{ doc: Document }>).detail?.doc;
+      if (!doc) {
+        return;
+      }
+      guardFoliateDoc(doc);
+      applyNamespacedAttributes(doc);
+      applyLinkHitArea(doc);
+      applyImageStyle(doc);
+      applyScrollModeClass(doc, false);
+      applyThemeModeClass(doc, settingsRef.current.theme !== "light");
+    };
+
+    // Readest: book.transformTarget 'data' olayı — yayıncının CSS'ini ve
+    // XHTML içeriğini iframe'e girmeden önce düzeltir.
+    const handleTransformData = (event: Event) => {
+      const detail = (event as CustomEvent<{ data: unknown; type: string }>).detail;
+      if (!detail) {
+        return;
+      }
+      const view = openedView;
+      detail.data = Promise.resolve(detail.data)
+        .then((data) => {
+          if (detail.type === "text/css" && typeof data === "string") {
+            return transformStylesheet(
+              data,
+              settingsRef.current.viewSettings.vertical,
+              view?.book?.rendition?.layout === "pre-paginated"
+            );
+          }
+          return data;
+        })
+        .catch(() => "");
+    };
+
     void (async () => {
       try {
+        await import("./foliate/view.js");
+        if (cancelled) {
+          return;
+        }
+
         const source = await resolveBookSource(activeBook);
         if (cancelled) {
           return;
         }
 
-        const primaryBook = createEpubBook(source.input);
-        const cacheBook = createEpubBook(source.input);
-        openedBook = primaryBook.book;
-        bookRef.current = openedBook;
-        openedCacheBook = cacheBook.book;
-        deepgramCacheBookRef.current = openedCacheBook;
+        const input = source.input;
+        bookInputRef.current = input;
 
-        await withTimeout(
-          Promise.all([primaryBook.openPromise, cacheBook.openPromise]),
-          EPUB_OPEN_TIMEOUT_MS,
-          "EPUB opening timed out."
-        );
+        const viewElement = document.createElement("foliate-view") as unknown as FoliateViewElement;
+        container.append(viewElement);
+        openedView = viewElement;
+        viewRef.current = viewElement;
+        viewElement.addEventListener("relocate", handleRelocate);
+        viewElement.addEventListener("load", handleDocLoad);
 
-        if (cancelled) {
+        await withTimeout(viewElement.open(input), EPUB_OPEN_TIMEOUT_MS, "EPUB opening timed out.");
+        if (cancelled || viewRef.current !== viewElement) {
           return;
         }
 
-        openedRendition = openedBook.renderTo(container, {
-          width: "100%",
-          height: "100%",
-          flow: "paginated",
-          spread: "auto",
-          minSpreadWidth: 900
-        });
+        const metadata = viewElement.book?.metadata;
+        const title = normalizeMetaText(metadata?.title) || activeBook.title || "Untitled EPUB";
+        const author = normalizeMetaText(metadata?.author) || activeBook.author;
+        setBookInfo({ title, author });
+        setLibrary((currentLibrary) =>
+          currentLibrary.map((storedBook) =>
+            storedBook.id === activeBook.id
+              ? { ...storedBook, title, author, updatedAt: new Date().toISOString() }
+              : storedBook
+          )
+        );
 
-        renditionRef.current = openedRendition;
-        openedRendition.hooks.content.register((contents: Contents) => {
-          applyContentStyles(contents, settingsRef.current);
-        });
-        openedCacheRendition = openedCacheBook.renderTo(cacheContainer, {
-          width: "100%",
-          height: "100%",
-          flow: "paginated",
-          spread: "auto",
-          minSpreadWidth: 900
-        });
-        deepgramCacheRenditionRef.current = openedCacheRendition;
-        openedCacheRendition.hooks.content.register((contents: Contents) => {
-          applyContentStyles(contents, settingsRef.current);
-        });
-        openedCacheRendition.themes.fontSize(`${settingsRef.current.fontSize}%`);
+        applyFoliateStyles(viewElement, settingsRef.current);
+        applyFoliateLayout(viewElement, settingsRef.current);
+        viewElement.book?.transformTarget?.addEventListener("data", handleTransformData);
 
-        openedRendition.themes.register("light", {
-          html: {
-            background: readerThemeColors.light.background,
-            color: readerThemeColors.light.text
-          },
-          body: {
-            background: readerThemeColors.light.background,
-            color: readerThemeColors.light.text,
-            "font-family": "Georgia, Cambria, 'Times New Roman', serif",
-            "line-height": "1.65"
-          },
-          a: { color: readerThemeColors.light.link }
-        });
-        openedRendition.themes.register("dark", {
-          html: {
-            background: readerThemeColors.dark.background,
-            color: readerThemeColors.dark.text
-          },
-          body: {
-            background: readerThemeColors.dark.background,
-            color: readerThemeColors.dark.text,
-            "font-family": "Georgia, Cambria, 'Times New Roman', serif",
-            "line-height": "1.65"
-          },
-          a: { color: readerThemeColors.dark.link }
-        });
-        applyReaderPreferences(openedRendition, settingsRef.current);
-
-        const saveReadingLocation = (location: Location) => {
-          if (!activeBookRef.current || !openedBook) {
-            return;
+        // Readest's paginator emits this after the iframe is laid out and its
+        // column/spread count is final.  Do not expose a half-paginated reader
+        // while the initial navigation is still settling.
+        const handleStabilized = () => {
+          if (!cancelled && viewRef.current === viewElement && didRelocate) {
+            pendingAddedBookIdsRef.current.delete(activeBook.id);
+            setReaderStatus("ready");
+            setAreLocationsReady(true);
           }
-
-          const cfi = location?.start?.cfi;
-          if (!cfi) {
-            return;
-          }
-
-          const href = location?.start?.href || "";
-          const percentage = getReadingPercentage(openedBook, location);
-          const pageInfo = getReadingPageInfo(openedBook, location, percentage);
-          const currentBookId = activeBookRef.current.id;
-
-          setLibrary((currentLibrary) =>
-            currentLibrary.map((storedBook) =>
-              storedBook.id === currentBookId
-                ? {
-                    ...storedBook,
-                    updatedAt: new Date().toISOString(),
-                    position: {
-                      cfi,
-                      href,
-                      percentage,
-                      isPrecise: percentage != null,
-                      progressMethod: PROGRESS_METHOD,
-                      updatedAt: new Date().toISOString()
-                    }
-                  }
-                : storedBook
-            )
-          );
-
-          setProgress({ href, percentage: percentage ?? null, page: pageInfo.page, totalPages: pageInfo.totalPages });
         };
+        viewElement.renderer.addEventListener("stabilized", handleStabilized);
 
-        openedRendition.on("relocated", (location: Location) => {
-          lastLocationRef.current = location;
-          const relocatedPageKey = getLocationSpeechKey(location);
-          if (
-            speechShouldContinueRef.current &&
-            speechPageKeyRef.current &&
-            relocatedPageKey !== speechPageKeyRef.current &&
-            !speechPageAdvanceInFlightRef.current
-          ) {
-            stopSpeech();
+        // Readest positions the first render either at the saved CFI or, when
+        // there is none, at the start of the text (`goToFraction(0)`), then lets
+        // the paginator settle.  `init` also records the initial history entry.
+        const startCfi = activeBook.position?.cfi || undefined;
+        try {
+          if (startCfi) {
+            await withTimeout(viewElement.init({ lastLocation: startCfi }), EPUB_OPEN_TIMEOUT_MS, "EPUB opening timed out.");
+          } else {
+            await withTimeout(viewElement.goToFraction(0), EPUB_OPEN_TIMEOUT_MS, "EPUB opening timed out.");
           }
-          saveReadingLocation(location);
-        });
-
-        Promise.allSettled([openedBook.loaded.metadata, openedBook.ready]).then(([metadataResult]) => {
-          if (cancelled || openFailed) {
+        } catch (error) {
+          // A stale saved CFI must not fail the whole open; fall back to start.
+          if (startCfi) {
+            try {
+              await withTimeout(viewElement.goToFraction(0), EPUB_OPEN_TIMEOUT_MS, "EPUB opening timed out.");
+            } catch (fallbackError) {
+              failOpenWithCause(fallbackError, "This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
+              return;
+            }
+          } else {
+            failOpenWithCause(error, "This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
             return;
           }
+        }
 
-          if (metadataResult.status === "fulfilled") {
-            const metadata = metadataResult.value || {};
-            const title = metadata.title || activeBook.title || "Untitled EPUB";
-            const author = formatAuthor(metadata.creator) || activeBook.author;
-            setBookInfo({ title, author });
+        // Some fixed-layout EPUBs do not emit `stabilized`; their initial
+        // relocation is already their final page layout.
+        if (!cancelled && !openFailed && viewElement.book?.rendition?.layout === "pre-paginated") {
+          handleStabilized();
+        }
 
-            setLibrary((currentLibrary) =>
-              currentLibrary.map((storedBook) =>
-                storedBook.id === activeBook.id
-                  ? { ...storedBook, title, author, updatedAt: new Date().toISOString() }
-                  : storedBook
-              )
-            );
+        // The off-screen view only preloads text for Deepgram.  It must never
+        // block opening or turn an otherwise valid book into a reader error.
+        const hiddenElement = document.createElement("foliate-view") as unknown as FoliateViewElement;
+        cacheContainer.append(hiddenElement);
+        openedHiddenView = hiddenElement;
+        hiddenViewRef.current = hiddenElement;
+        hiddenElement.addEventListener("relocate", handleHiddenRelocate);
+        hiddenElement.addEventListener("load", handleDocLoad);
+        try {
+          // Match the visible view's column math so cached page text lines up.
+          applyFoliateLayout(hiddenElement, settingsRef.current);
+          await withTimeout(hiddenElement.open(input), EPUB_OPEN_TIMEOUT_MS, "Hidden EPUB preload timed out.");
+          if (!cancelled && hiddenViewRef.current === hiddenElement) {
+            applyFoliateStyles(hiddenElement, settingsRef.current);
           }
-        });
-
-        openedBook.ready
-          .then(async () => {
-            if (!cancelled && !openFailed && openedBook) {
-              try {
-                await openedBook.locations.generate(1000);
-              } catch {
-                // Displayed page data is still available if generated locations fail.
-              }
-            }
-
-            if (!cancelled && !openFailed && openedRendition) {
-              setAreLocationsReady(true);
-              openedRendition.reportLocation();
-            }
-          })
-          .catch(() => {
-            failOpen("This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
-          });
-
-        withTimeout(
-          openedRendition.display(activeBook.position?.cfi || undefined),
-          EPUB_OPEN_TIMEOUT_MS,
-          "EPUB opening timed out."
-        )
-          .then(() => {
-            if (!cancelled && !openFailed) {
-              pendingAddedBookIdsRef.current.delete(activeBook.id);
-              setReaderStatus("ready");
-            }
-          })
-          .catch(() => {
-            failOpen("This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
-          });
+        } catch (error) {
+          console.warn("EPUB text preload was unavailable; reading remains available.", error);
+          destroyFoliateView(hiddenElement);
+          if (hiddenViewRef.current === hiddenElement) {
+            hiddenViewRef.current = null;
+          }
+        }
 
         handleKeyDown = (event: KeyboardEvent) => {
-          if (!openedRendition) {
+          if (!openedView) {
             return;
           }
 
@@ -2708,8 +3387,8 @@ function App() {
         };
 
         window.addEventListener("keydown", handleKeyDown);
-      } catch {
-        failOpen("This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
+      } catch (error) {
+        failOpenWithCause(error, "This EPUB could not be opened. Check that the file is valid and the URL allows browser access.");
       }
     })();
 
@@ -2718,6 +3397,7 @@ function App() {
       manualPageNavigationGenerationRef.current += 1;
       manualPageNavigationInFlightRef.current = false;
       pageNavigationOriginRef.current = null;
+      pendingManualTurnsRef.current = 0;
       pendingManualPageDirectionRef.current = null;
       speechPageAdvanceInFlightRef.current = false;
       clearSpeechPageTurnWait();
@@ -2726,24 +3406,15 @@ function App() {
       if (handleKeyDown) {
         window.removeEventListener("keydown", handleKeyDown);
       }
-      openedRendition?.destroy();
-      openedBook?.destroy();
-      openedCacheRendition?.destroy();
-      openedCacheBook?.destroy();
-      if (renditionRef.current === openedRendition) {
-        renditionRef.current = null;
+      destroyFoliateView(openedView);
+      destroyFoliateView(openedHiddenView);
+      if (viewRef.current === openedView) {
+        viewRef.current = null;
       }
-      if (bookRef.current === openedBook) {
-        bookRef.current = null;
+      if (hiddenViewRef.current === openedHiddenView) {
+        hiddenViewRef.current = null;
       }
-      if (deepgramCacheRenditionRef.current === openedCacheRendition) {
-        deepgramCacheRenditionRef.current = null;
-      }
-      if (deepgramCacheBookRef.current === openedCacheBook) {
-        deepgramCacheBookRef.current = null;
-      }
-    };
-  }, [activeBook?.id, removePendingAddedBook]);
+    };  }, [activeBook?.id, removePendingAddedBook]);
 
   const addBookFromInput = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2782,10 +3453,19 @@ function App() {
     }
   };
 
+  const showSidebar = () => {
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      setIsSidebarPinned(false);
+    }
+    setIsSidebarOpen(true);
+  };
+
   const openBook = (bookId: string) => {
     setActiveBookId(bookId);
-    setIsLibraryOpen(false);
     setIsAddOpen(false);
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      setIsSidebarOpen(false);
+    }
   };
 
   const removeBook = (bookId: string) => {
@@ -2798,7 +3478,6 @@ function App() {
     if (activeBookId === bookId) {
       const nextBook = library.find((book) => book.id !== bookId);
       setActiveBookId(nextBook?.id ?? null);
-      setIsAddOpen(!nextBook);
       if (!nextBook) {
         setBookInfo(null);
         setProgress(null);
@@ -2808,28 +3487,51 @@ function App() {
     }
   };
 
-  function finishPageNavigation(rendition: Rendition, generation: number): void {
+  function finishPageNavigation(view: FoliateViewElement, generation: number): void {
+    // Kilitler her zaman temizlenmeli. Önceden aşağıdaki guard'da erken
+    // dönüldüğünde `manualPageNavigationInFlightRef` true kalıyordu ve
+    // konuşmanın sayfa takibi (advanceAfterSpeechPage) bir daha asla
+    // çevirme yapamıyordu.
+    manualPageNavigationInFlightRef.current = false;
+    pageNavigationOriginRef.current = null;
+
     if (
       generation !== manualPageNavigationGenerationRef.current ||
-      renditionRef.current !== rendition
+      viewRef.current !== view
     ) {
       return;
     }
 
-    manualPageNavigationInFlightRef.current = false;
-    pageNavigationOriginRef.current = null;
+    // Konuşma sürerken sayfa takibi var; elle kuyruğu boşaltmak konuşmanın
+    // okuduğu sayfayı kaydırır ve konuşmayı keser.
+    if (speechShouldContinueRef.current) {
+      return;
+    }
+
     const pendingDirection = pendingManualPageDirectionRef.current;
     pendingManualPageDirectionRef.current = null;
     if (pendingDirection) {
       navigateManually(pendingDirection);
+      return;
+    }
+    // Kuyrukta başka çevirme varsa sıradakini başlat. Coalescing: basılan tuş
+    // sayısı kadar çevirme yapılır ama her turda yalnızca biri işlenir, bu
+    // yüzden okuyucu animasyonu boğulmadan hızı korur.
+    if (pendingManualTurnsRef.current !== 0) {
+      const direction = pendingManualTurnsRef.current > 0 ? "next" : "previous";
+      pendingManualTurnsRef.current += pendingManualTurnsRef.current > 0 ? -1 : 1;
+      navigateManually(direction);
     }
   }
 
   function moveManualPageAndWaitForRelocation(
-    rendition: Rendition,
+    view: FoliateViewElement,
     direction: "previous" | "next"
   ): Promise<void> {
-    const previousPageKey = getLocationSpeechKey(lastLocationRef.current || rendition.location || null);
+    const previousPageKey = getLocationSpeechKey(lastLocationRef.current);
+    // CFI bölüm sınırında değişmeyebilir; bölüm+sayfa imzası da izlenir ki
+    // çevirme gerçekten bitmeden kilitli kalmayalım.
+    const previousSignature = getRendererSignature(view);
 
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -2840,7 +3542,7 @@ function App() {
           window.clearTimeout(timeoutId);
           timeoutId = null;
         }
-        rendition.off("relocated", handleRelocated);
+        view.removeEventListener("relocate", handleRelocated);
       };
       const finish = () => {
         if (settled) {
@@ -2858,41 +3560,63 @@ function App() {
         cleanup();
         reject(error);
       };
-      const hasNavigationFinished = (location: Location | null) =>
+      const hasNavigationFinished = (location: ReaderLoc | null) =>
         Boolean(
           location &&
             (getLocationSpeechKey(location) !== previousPageKey ||
               (direction === "next" ? location.atEnd : location.atStart))
         );
-      const handleRelocated = (location: Location) => {
-        if (hasNavigationFinished(location)) {
+      const handleRelocated = (event: Event) => {
+        const detail = (event as CustomEvent<FoliateRelocateDetail>).detail;
+        if (hasNavigationFinished(toReaderLoc(detail))) {
+          finish();
+          return;
+        }
+        // Konum aynı kaldıysa imza değişmiş olabilir (yeni bölüm/sayfa).
+        if (getRendererSignature(view) !== previousSignature) {
           finish();
         }
       };
 
-      rendition.on("relocated", handleRelocated);
-      timeoutId = window.setTimeout(finish, SPEECH_PAGE_TURN_TIMEOUT_MS);
-      const navigation = direction === "previous" ? rendition.prev() : rendition.next();
+      view.addEventListener("relocate", handleRelocated);
+      timeoutId = window.setTimeout(finish, MANUAL_PAGE_TURN_TIMEOUT_MS);
+      // Readest: sayfa çevirme viewPagination üzerinden yapılır.
+      const navigation =
+        viewPagination(
+          view as unknown as Parameters<typeof viewPagination>[0],
+          (direction === "previous" ? "left" : "right") as PaginationSide,
+          "page",
+          { rtl: view.book?.dir === "rtl", zoomLevel: 100, zoomMode: "fit-page" }
+        ) ?? Promise.resolve();
       navigation
         .then(() => {
-          if (hasNavigationFinished(lastLocationRef.current || rendition.location || null)) {
+          if (hasNavigationFinished(lastLocationRef.current)) {
+            finish();
+            return;
+          }
+          if (getRendererSignature(view) !== previousSignature) {
             finish();
           }
         })
-        .catch(fail);
+        .catch(() => {
+          // Motor bu çevirmeyi reddettiyse (ör. bölüm yüklenemedi) kilitli
+          // kalıp donmamak için turu başarısız sayıp kuyruğu boşalt.
+          fail(new Error("Page turn was rejected by the renderer."));
+        });
     });
   }
 
   function navigateManually(direction: "previous" | "next"): void {
     resetSpeechForManualPageChange();
-    const rendition = renditionRef.current;
-    if (!rendition || !lastLocationRef.current) {
+    const view = viewRef.current;
+    if (!view || !lastLocationRef.current) {
       return;
     }
 
     if (manualPageNavigationInFlightRef.current) {
       if (pageNavigationOriginRef.current !== "speech" || direction === "previous") {
         pendingManualPageDirectionRef.current = direction;
+        pendingManualTurnsRef.current += direction === "next" ? 1 : -1;
       }
       return;
     }
@@ -2900,12 +3624,12 @@ function App() {
     const generation = manualPageNavigationGenerationRef.current;
     manualPageNavigationInFlightRef.current = true;
     pageNavigationOriginRef.current = "manual";
-    void moveManualPageAndWaitForRelocation(rendition, direction)
+    void moveManualPageAndWaitForRelocation(view, direction)
       .catch((error) => {
         console.error("EPUB page navigation failed.", error);
       })
       .finally(() => {
-        finishPageNavigation(rendition, generation);
+        finishPageNavigation(view, generation);
       });
   }
 
@@ -2954,33 +3678,51 @@ function App() {
   }
 
   const goToProgress = (nextProgress: number) => {
-    const book = bookRef.current;
-    const rendition = renditionRef.current;
-    if (!book || !rendition || readerStatus !== "ready") {
+    const view = viewRef.current;
+    if (!view || readerStatus !== "ready") {
       return;
     }
 
     const clampedProgress = Math.min(100, Math.max(0, nextProgress));
-    const generatedLocationCount = book.locations?.length?.() || 0;
     resetSpeechForManualPageChange();
-
-    if (generatedLocationCount > 0) {
-      rendition.display(book.locations.cfiFromPercentage(clampedProgress / 100));
-    }
+    void view.goToFraction(clampedProgress / 100).catch((error) => {
+      console.error("EPUB progress navigation failed.", error);
+    });
   };
 
-  const updateFontSize = (delta: number) => {
+  const updateViewSettings = (patch: Partial<ViewSettings>) => {
     resetSpeechForManualPageChange();
     setSettings((currentSettings) => ({
       ...currentSettings,
-      fontSize: Math.min(150, Math.max(75, currentSettings.fontSize + delta))
+      viewSettings: { ...currentSettings.viewSettings, ...patch }
     }));
   };
+
+  const updateFontSize = (delta: number) => {
+    updateViewSettings({
+      defaultFontSize: Math.min(
+        36,
+        Math.max(
+          10,
+          Math.round((settings.viewSettings.defaultFontSize + delta / 10) * 10) / 10
+        )
+      )
+    });
+  };
+
+  const formatFontSize = (px: number) => `${Number.isInteger(px) ? px : px.toFixed(1)}px`;
 
   const toggleTheme = () => {
     setSettings((currentSettings) => ({
       ...currentSettings,
       theme: currentSettings.theme === "light" ? "dark" : "light"
+    }));
+  };
+
+  const updateThemeName = (themeName: string) => {
+    setSettings((currentSettings) => ({
+      ...currentSettings,
+      themeName
     }));
   };
 
@@ -3129,226 +3871,76 @@ function App() {
     !isSpeechProviderSupported(selectedSpeechProvider) ||
     speechMode === "unsupported";
 
+  const themeName = settings.themeName || "default";
+  const isDark = settings.theme !== "light";
+  const filteredLibrary = library;
+
   useEffect(() => {
     document.title = formattedProgress ? `${formattedProgress} - ${readerTitle}` : readerTitle;
   }, [formattedProgress, readerTitle]);
-
-  return (
-    <main className={`app theme-${settings.theme}`}>
-      <button
-        type="button"
-        className={`floating-menu-button ${isToolbarOpen ? "toolbar-open" : ""}`}
-        onClick={() => setIsToolbarOpen(true)}
-        title="Open menu"
+  return (
+    <div className="app">
+      {isSidebarOpen && !isSidebarPinned && (
+        <button
+          type="button"
+          className="sidebar-overlay"
+          onClick={() => setIsSidebarOpen(false)}
+          aria-label="Close sidebar"
+        />
+      )}
+      <aside
+        aria-label="Sidebar"
+        className={`sidebar${isSidebarOpen ? " open" : ""}${isSidebarPinned ? "" : " floating"}`}
       >
-        <Menu aria-hidden="true" size={21} />
-      </button>
+        <div className="sidebar-header" dir="ltr">
+          <span className="sidebar-actions">
+            <button
+              type="button"
+              title="Close sidebar"
+              onClick={() => setIsSidebarOpen(false)}
+              className="icon-btn mobile-only"
+            >
+              <X aria-hidden="true" size={19} />
+            </button>
+            <button
+              type="button"
+              title="Collapse sidebar"
+              onClick={() => setIsSidebarOpen(false)}
+              className="icon-btn desktop-only"
+            >
+              <PanelLeft aria-hidden="true" size={18} />
+            </button>
+          </span>
+        </div>
 
-      <header className={`reader-toolbar ${isToolbarOpen ? "open" : ""}`}>
-        <button type="button" className="toolbar-close-button" onClick={() => setIsToolbarOpen(false)} title="Close menu">
-          <X aria-hidden="true" size={19} />
-        </button>
-
-        <div className="title-block">
-          <BookOpen aria-hidden="true" size={20} />
-          <div>
-            <div className="title-line">
-              <h1>{readerTitle}</h1>
+        {activeBook && (
+          <div className="current-book">
+            <div className="current-book-row">
+              <span className="current-book-icon">
+                <BookMarked aria-hidden="true" size={17} />
+              </span>
+              <span className="current-book-meta">
+                <span className="current-book-title">
+                  {bookInfo?.title || activeBook.title || "Untitled EPUB"}
+                </span>
+                <span className="current-book-sub">
+                  {bookInfo?.author || activeBook.author || getBookDescription(activeBook)}
+                </span>
+              </span>
               {formattedProgress && <span className="progress-pill">{formattedProgress}</span>}
             </div>
-            <p>{readerAuthor || (activeBook ? getBookDescription(activeBook) : "Add an EPUB URL to start reading")}</p>
           </div>
-        </div>
+        )}
 
-        <div className="toolbar-actions" aria-label="Reader controls">
-          <button
-            type="button"
-            className={`icon-button speech-button ${isSpeechActive ? "active" : ""} ${isSpeechLoading ? "loading" : ""}`}
-            onClick={() => void toggleSpeech()}
-            title={speechButtonTitle}
-            aria-label={speechButtonTitle}
-            disabled={isSpeechButtonDisabled}
-          >
-            {isSpeechLoading ? (
-              <LoaderCircle aria-hidden="true" className="speech-loading-icon" size={19} />
-            ) : speechMode === "playing" ? (
-              <Pause aria-hidden="true" size={19} />
-            ) : (
-              <Play aria-hidden="true" size={19} />
-            )}
-          </button>
-          <button type="button" className="icon-button" onClick={() => setIsLibraryOpen(true)} title="Library">
-            <Library aria-hidden="true" size={19} />
-          </button>
-          <button type="button" className="icon-button" onClick={openAddDialog} title="Add EPUB">
-            <Plus aria-hidden="true" size={20} />
-          </button>
-          <select
-            className="provider-select"
-            value={selectedSpeechProvider}
-            onChange={(event) => updateSpeechProvider(event.currentTarget.value as SpeechProvider)}
-            title="Read aloud provider"
-            aria-label="Read aloud provider"
-          >
-            {SPEECH_PROVIDER_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <select
-            className="language-select"
-            value={selectedSpeechLanguage}
-            onChange={(event) => updateSpeechLanguage(event.currentTarget.value)}
-            title="Read aloud language"
-            aria-label="Read aloud language"
-          >
-            {speechLanguageOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          {selectedSpeechProvider === "ema" && (
-            <select
-              className="model-select"
-              value={selectedEmaVoice}
-              onChange={(event) => updateEmaVoice(event.currentTarget.value)}
-              title="Ema voice"
-              aria-label="Ema voice"
-            >
-              {EMA_VOICE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          )}
-          {selectedSpeechProvider === "piper" && (
-            <select
-              className="model-select"
-              value={selectedPiperVoice}
-              onChange={(event) => updatePiperVoice(event.currentTarget.value)}
-              title="Piper voice"
-              aria-label="Piper voice"
-            >
-              {PIPER_VOICE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          )}
-          {selectedSpeechProvider === "deepgram" && (
-            <select
-              className="model-select"
-              value={selectedDeepgramModel}
-              onChange={(event) => updateDeepgramModel(event.currentTarget.value)}
-              title="Deepgram voice model"
-              aria-label="Deepgram voice model"
-            >
-              {deepgramModelOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          )}
-          <div className="control-group" aria-label="Font size">
-            <button type="button" className="icon-button" onClick={() => updateFontSize(-5)} title="Smaller text">
-              <Minus aria-hidden="true" size={18} />
-            </button>
-            <span className="font-indicator">{settings.fontSize}%</span>
-            <button type="button" className="icon-button" onClick={() => updateFontSize(5)} title="Larger text">
-              <Plus aria-hidden="true" size={18} />
-            </button>
-          </div>
-          <div className="page-control" aria-label="Page navigation">
-            <span className="page-count">{pageLabel}</span>
-            <input
-              className="page-slider"
-              type="range"
-              min="0"
-              max="1000"
-              step="1"
-              value={sliderValue}
-              onChange={(event) => goToProgress(Number(event.currentTarget.value) / 10)}
-              disabled={!activeBook || readerStatus !== "ready" || !areLocationsReady}
-              aria-label="Reading progress"
-            />
-          </div>
-          <button type="button" className="icon-button" onClick={toggleTheme} title="Toggle theme">
-            {settings.theme === "light" ? <Moon aria-hidden="true" size={19} /> : <Sun aria-hidden="true" size={19} />}
-          </button>
-        </div>
-      </header>
-
-      {speechError && (
-        <div className="speech-error" role="alert">
-          {speechError}
-        </div>
-      )}
-
-      <section className="reader-shell" aria-label="Book reader">
-        <div className="viewer-panel">
-          {!activeBook && (
-            <div className="empty-state">
-              <BookOpen aria-hidden="true" size={44} />
-              <h2>No EPUB selected</h2>
-              <p>Use the plus button to add a book, upload an EPUB file, or open this page with an epub query string.</p>
-              <code>?epub=https://example.com/book.epub</code>
-            </div>
-          )}
-          {readerStatus === "loading" && activeBook && <div className="loading-state">Opening EPUB...</div>}
-          {readerError && <div className="error-state">{readerError}</div>}
-          <div ref={viewerRef} className="viewer" />
-        </div>
-
-        <button
-          type="button"
-          className="page-zone page-zone-left"
-          onClick={() => clickPageZone("previous")}
-          onPointerDown={() => startPageHoldNavigation("previous")}
-          onPointerUp={finishPageHoldNavigation}
-          onPointerCancel={finishPageHoldNavigation}
-          onPointerLeave={finishPageHoldNavigation}
-          aria-label="Previous page"
-        />
-        <button
-          type="button"
-          className="page-zone page-zone-right"
-          onClick={() => clickPageZone("next")}
-          onPointerDown={() => startPageHoldNavigation("next")}
-          onPointerUp={finishPageHoldNavigation}
-          onPointerCancel={finishPageHoldNavigation}
-          onPointerLeave={finishPageHoldNavigation}
-          aria-label="Next page"
-        />
-      </section>
-      <div ref={deepgramCacheContainerRef} className="deepgram-cache-viewer" aria-hidden="true" />
-
-      {isLibraryOpen && (
-        <aside className="drawer" aria-label="Saved books">
-          <div className="drawer-header">
-            <h2>Library</h2>
-            <div className="drawer-actions">
-              <button type="button" className="icon-button" onClick={openAddDialog} title="Add EPUB">
-                <Plus aria-hidden="true" size={20} />
-              </button>
-              <button type="button" className="icon-button" onClick={() => setIsLibraryOpen(false)} title="Close library">
-                <X aria-hidden="true" size={19} />
-              </button>
-            </div>
-          </div>
-
-          <div className="book-list">
-            {library.length === 0 && <p className="muted-text">No saved books yet.</p>}
-            {library.map((book) => (
-              <article className={`book-card ${book.id === activeBookId ? "active" : ""}`} key={book.id}>
-                <button type="button" className="book-open-button" onClick={() => openBook(book.id)}>
-                  <span>{book.title || "Untitled EPUB"}</span>
-                  <small>{book.author || getBookDescription(book)}</small>
-                  {formatProgress(
+        <div className="sidebar-scroll">
+          <section className="panel" aria-label="Library">
+            <div className="boxed-list">
+              <div className="boxed-list-rows">
+                {filteredLibrary.length === 0 && (
+                  <div className="empty-note">No saved books yet.</div>
+                )}
+                {filteredLibrary.map((book) => {
+                  const bookProgress =
                     book.id === activeBookId
                       ? areLocationsReady
                         ? progress?.percentage ??
@@ -3358,86 +3950,459 @@ function App() {
                         : null
                       : book.position?.isPrecise && book.position.progressMethod === PROGRESS_METHOD
                         ? book.position.percentage
-                        : null
-                  ) && (
-                    <em>
-                      {formatProgress(
-                        book.id === activeBookId
-                          ? areLocationsReady
-                            ? progress?.percentage ??
-                              (book.position?.isPrecise && book.position.progressMethod === PROGRESS_METHOD
-                                ? book.position.percentage
-                                : null)
-                            : null
-                          : book.position?.isPrecise && book.position.progressMethod === PROGRESS_METHOD
-                            ? book.position.percentage
-                            : null
-                      )} read
-                    </em>
-                  )}
-                </button>
-                <button type="button" className="icon-button danger" onClick={() => removeBook(book.id)} title="Remove book">
-                  <Trash2 aria-hidden="true" size={17} />
-                </button>
-              </article>
-            ))}
+                        : null;
+                  return (
+                    <div key={book.id} className={`book-row${book.id === activeBookId ? " active" : ""}`}>
+                      <button type="button" onClick={() => openBook(book.id)} className="book-open">
+                        <span className="book-open-title">{book.title || "Untitled EPUB"}</span>
+                        <span className="book-open-sub">{book.author || getBookDescription(book)}</span>
+                        {formatProgress(bookProgress) && (
+                          <span className="book-open-progress">{formatProgress(bookProgress)} read</span>
+                        )}
+                      </button>
+                      <span className="book-row-side">
+                        <ChevronRight aria-hidden="true" size={16} />
+                        <button
+                          type="button"
+                          onClick={() => removeBook(book.id)}
+                          title="Remove book"
+                          aria-label={`Remove ${book.title || "book"}`}
+                          className="mini-btn danger"
+                        >
+                          <Trash2 aria-hidden="true" size={16} />
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <button type="button" onClick={openAddDialog} className="list-extension">
+              <span className="list-extension-chip">
+                <Plus aria-hidden="true" size={14} />
+              </span>
+              <span className="list-extension-label">Add EPUB</span>
+            </button>
+          </section>
+
+          <section className="panel" aria-label="Read aloud">
+            <h2 className="panel-title">Read aloud</h2>
+            <div className="boxed-list">
+              <div className="boxed-list-rows">
+                <div className="setting-row">
+                  <span className="row-label">Provider</span>
+                  <select
+                    value={selectedSpeechProvider}
+                    onChange={(event) => updateSpeechProvider(event.currentTarget.value as SpeechProvider)}
+                    className="chrome-select"
+                    aria-label="Read aloud provider"
+                  >
+                    {SPEECH_PROVIDER_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="setting-row">
+                  <span className="row-label">Language</span>
+                  <select
+                    value={selectedSpeechLanguage}
+                    onChange={(event) => updateSpeechLanguage(event.currentTarget.value)}
+                    className="chrome-select"
+                    aria-label="Read aloud language"
+                  >
+                    {speechLanguageOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {selectedSpeechProvider === "ema" && (
+                  <div className="setting-row">
+                    <span className="row-label">Voice</span>
+                    <select
+                      value={selectedEmaVoice}
+                      onChange={(event) => updateEmaVoice(event.currentTarget.value)}
+                      className="chrome-select"
+                      aria-label="Ema voice"
+                    >
+                      {EMA_VOICE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {selectedSpeechProvider === "piper" && (
+                  <div className="setting-row">
+                    <span className="row-label">Voice</span>
+                    <select
+                      value={selectedPiperVoice}
+                      onChange={(event) => updatePiperVoice(event.currentTarget.value)}
+                      className="chrome-select"
+                      aria-label="Piper voice"
+                    >
+                      {PIPER_VOICE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {selectedSpeechProvider === "deepgram" && (
+                  <div className="setting-row">
+                    <span className="row-label">Voice</span>
+                    <select
+                      value={selectedDeepgramModel}
+                      onChange={(event) => updateDeepgramModel(event.currentTarget.value)}
+                      className="chrome-select"
+                      aria-label="Deepgram voice model"
+                    >
+                      {deepgramModelOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+
+<section className="panel" aria-label="Appearance">
+            <h2 className="panel-title">Appearance</h2>
+            <div className="boxed-list">
+              <div className="boxed-list-rows">
+                <div className="setting-row">
+                  <span className="row-label">Color theme</span>
+                  <select
+                    value={themeName}
+                    onChange={(event) => updateThemeName(event.currentTarget.value)}
+                    className="chrome-select"
+                    aria-label="Color theme"
+                  >
+                    {THEME_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <label className="setting-row">
+                  <span className="row-label">Dark mode</span>
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    checked={isDark}
+                    onChange={toggleTheme}
+                    aria-label="Dark mode"
+                  />
+                </label>
+                <div className="setting-row">
+                  <span className="row-label">Font size</span>
+                  <span className="row-control">
+                    <button
+                      type="button"
+                      onClick={() => updateFontSize(-5)}
+                      title="Smaller text"
+                      className="icon-btn"
+                    >
+                      <Minus aria-hidden="true" size={15} />
+                    </button>
+                    <span className="font-value">{formatFontSize(settings.viewSettings.defaultFontSize)}</span>
+                    <button
+                      type="button"
+                      onClick={() => updateFontSize(5)}
+                      title="Larger text"
+                      className="icon-btn"
+                    >
+                      <Plus aria-hidden="true" size={15} />
+                    </button>
+                  </span>
+                </div>
+                <div className="setting-row">
+                  <span className="row-label">Font</span>
+                  <select
+                    value={settings.viewSettings.defaultFont}
+                    onChange={(event) =>
+                      updateViewSettings({ defaultFont: event.currentTarget.value as DefaultFont })
+                    }
+                    className="chrome-select"
+                    aria-label="Font"
+                  >
+                    <option value="Serif">Serif</option>
+                    <option value="Sans-serif">Sans</option>
+                  </select>
+                </div>
+                <div className="setting-row">
+                  <span className="row-label">Line height</span>
+                  <select
+                    value={String(settings.viewSettings.lineHeight)}
+                    onChange={(event) =>
+                      updateViewSettings({ lineHeight: Number(event.currentTarget.value) })
+                    }
+                    className="chrome-select"
+                    aria-label="Line height"
+                  >
+                    <option value="1.2">Tight</option>
+                    <option value="1.4">Normal</option>
+                    <option value="1.6">Relaxed</option>
+                    <option value="1.8">Loose</option>
+                  </select>
+                </div>
+                <div className="setting-row">
+                  <span className="row-label">Columns</span>
+                  <select
+                    value={String(settings.viewSettings.maxColumnCount)}
+                    onChange={(event) =>
+                      updateViewSettings({ maxColumnCount: Number(event.currentTarget.value) })
+                    }
+                    className="chrome-select"
+                    aria-label="Columns"
+                  >
+                    <option value="1">Single</option>
+                    <option value="2">Two-page</option>
+                  </select>
+                </div>
+                <div className="setting-row">
+                  <span className="row-label">Side margin</span>
+                  <select
+                    value={String(settings.viewSettings.marginLeftPx)}
+                    onChange={(event) =>
+                      updateViewSettings({
+                        marginLeftPx: Number(event.currentTarget.value),
+                        marginRightPx: Number(event.currentTarget.value)
+                      })
+                    }
+                    className="chrome-select"
+                    aria-label="Side margin"
+                  >
+                    <option value="8">Narrow</option>
+                    <option value="16">Normal</option>
+                    <option value="32">Wide</option>
+                  </select>
+                </div>
+                <label className="setting-row">
+                  <span className="row-label">Page turn animation</span>
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    checked={settings.viewSettings.animated}
+                    onChange={(event) =>
+                      updateViewSettings({ animated: event.currentTarget.checked })
+                    }
+                    aria-label="Page turn animation"
+                  />
+                </label>
+                <label className="setting-row">
+                  <span className="row-label">Justify text</span>
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    checked={settings.viewSettings.fullJustification}
+                    onChange={(event) =>
+                      updateViewSettings({ fullJustification: event.currentTarget.checked })
+                    }
+                    aria-label="Justify text"
+                  />
+                </label>
+                <label className="setting-row">
+                  <span className="row-label">Hyphenation</span>
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    checked={settings.viewSettings.hyphenation}
+                    onChange={(event) =>
+                      updateViewSettings({ hyphenation: event.currentTarget.checked })
+                    }
+                    aria-label="Hyphenation"
+                  />
+                </label>
+              </div>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <div className="main-col">
+        <div role="banner" aria-label="Header Bar" className="header-bar">
+          <div className="header-start">
+            {!isSidebarOpen && (
+              <button
+                type="button"
+                title="Open sidebar"
+                onClick={showSidebar}
+                className="icon-btn"
+              >
+                <PanelLeft aria-hidden="true" size={18} />
+              </button>
+            )}
+            <button
+              type="button"
+              title={speechButtonTitle}
+              aria-label={speechButtonTitle}
+              onClick={() => void toggleSpeech()}
+              disabled={isSpeechButtonDisabled}
+              className={`icon-btn${isSpeechActive ? " active" : ""}`}
+            >
+              {isSpeechLoading ? (
+                <LoaderCircle aria-hidden="true" size={18} className="spin" />
+              ) : speechMode === "playing" ? (
+                <Pause aria-hidden="true" size={18} />
+              ) : (
+                <Play aria-hidden="true" size={18} />
+              )}
+            </button>
           </div>
-        </aside>
-      )}
+
+          <div role="contentinfo" aria-label={`Title - ${readerTitle}`} className="header-title">
+            <span aria-hidden="true">{readerTitle}</span>
+          </div>
+
+          <div className="header-end">
+            <span className="page-label">{pageLabel}</span>
+          </div>
+        </div>
+
+        {speechError && (
+          <div className="toast-error" role="alert">
+            {speechError}
+          </div>
+        )}
+
+        <section className="reader-shell" aria-label="Book reader">
+          {!activeBook && (
+            <div className="empty-state">
+              <BookOpen aria-hidden="true" size={44} />
+              <h2>No EPUB selected</h2>
+              <p>Add a book from the sidebar, upload an EPUB file, or open this page with an epub query string.</p>
+              <code>?epub=https://example.com/book.epub</code>
+              <button type="button" className="cta-button" onClick={openAddDialog}>
+                Add EPUB
+              </button>
+            </div>
+          )}
+          {readerStatus === "loading" && activeBook && <div className="loading-state">Opening EPUB...</div>}
+          {readerError && <div className="error-state">{readerError}</div>}
+          <div ref={viewerRef} className="viewer" />
+
+          {activeBook && (
+            <button
+              type="button"
+              className="page-zone left"
+              onClick={() => clickPageZone("previous")}
+              onPointerDown={() => startPageHoldNavigation("previous")}
+              onPointerUp={finishPageHoldNavigation}
+              onPointerCancel={finishPageHoldNavigation}
+              onPointerLeave={finishPageHoldNavigation}
+              aria-label="Previous page"
+            />
+          )}
+          {activeBook && (
+            <button
+              type="button"
+              className="page-zone right"
+              onClick={() => clickPageZone("next")}
+              onPointerDown={() => startPageHoldNavigation("next")}
+              onPointerUp={finishPageHoldNavigation}
+              onPointerCancel={finishPageHoldNavigation}
+              onPointerLeave={finishPageHoldNavigation}
+              aria-label="Next page"
+            />
+          )}
+        </section>
+
+        <div className="footer-bar" aria-label="Reading progress">
+          <span className="page-label" style={{ display: "inline" }}>{pageLabel}</span>
+          {pageCountProgress && (
+            <span className="page-counting" aria-live="polite">
+              counting {pageCountProgress.done}/{pageCountProgress.total}
+            </span>
+          )}
+          <input
+            className="progress-range"
+            type="range"
+            min="0"
+            max="1000"
+            step="1"
+            value={sliderValue}
+            onChange={(event) => goToProgress(Number(event.currentTarget.value) / 10)}
+            disabled={!activeBook || readerStatus !== "ready" || !areLocationsReady}
+            aria-label="Reading progress"
+          />
+          {formattedProgress && <span className="progress-pill">{formattedProgress}</span>}
+        </div>
+
+        <div ref={deepgramCacheContainerRef} className="cache-viewer" aria-hidden="true" />
+        <div ref={pageCounterContainerRef} className="page-counter-viewer" aria-hidden="true" />
+      </div>
 
       {isAddOpen && (
         <div className="modal-layer" role="presentation">
-          <form className="add-dialog" onSubmit={addBookFromInput}>
-            <div className="drawer-header">
+          <form className="modal-box" onSubmit={addBookFromInput}>
+            <div className="modal-header">
               <h2>Add EPUB</h2>
-              <button type="button" className="icon-button" onClick={() => setIsAddOpen(false)} title="Close add dialog">
-                <X aria-hidden="true" size={19} />
+              <button
+                type="button"
+                className="icon-btn modal-close"
+                onClick={() => setIsAddOpen(false)}
+                title="Close add dialog"
+              >
+                <X aria-hidden="true" size={18} />
               </button>
             </div>
-            {addDialogError && (
-              <div className="dialog-error" role="alert">
-                {addDialogError}
-              </div>
-            )}
-            <label htmlFor="book-url">EPUB URL</label>
-            <input
-              id="book-url"
-              type="url"
-              value={urlInput}
-              onChange={(event) => setUrlInput(event.target.value)}
-              placeholder="https://example.com/book.epub"
-              autoFocus
-              required
-            />
-            <button type="submit" className="primary-button">
-              Add and open
-            </button>
-            <div className="dialog-divider" aria-hidden="true">
-              <span />
-              <strong>or</strong>
-              <span />
-            </div>
-            <label className={`upload-button ${isUploadingBook ? "disabled" : ""}`} htmlFor="book-file">
-              {isUploadingBook ? (
-                <LoaderCircle aria-hidden="true" className="speech-loading-icon" size={18} />
-              ) : (
-                <Upload aria-hidden="true" size={18} />
+            <div className="modal-body">
+              <h3>Add a book to your library</h3>
+              <p className="muted">Paste an EPUB link or upload a file from your device.</p>
+              {addDialogError && (
+                <div className="dialog-error" role="alert">
+                  {addDialogError}
+                </div>
               )}
-              <span>{isUploadingBook ? "Saving EPUB..." : "Upload EPUB file"}</span>
-            </label>
-            <input
-              ref={fileInputRef}
-              id="book-file"
-              className="file-input"
-              type="file"
-              accept=".epub,application/epub+zip"
-              onChange={(event) => void addBookFromFile(event)}
-              disabled={isUploadingBook}
-            />
+              <label className="field-label" htmlFor="book-url">EPUB URL</label>
+              <input
+                id="book-url"
+                className="text-input"
+                type="url"
+                value={urlInput}
+                onChange={(event) => setUrlInput(event.target.value)}
+                placeholder="https://example.com/book.epub"
+                autoFocus
+                required
+              />
+              <button type="submit" className="contrast-button">
+                Add and open
+              </button>
+              <div className="dialog-divider" aria-hidden="true">
+                or
+              </div>
+              <label className={`upload-label${isUploadingBook ? " disabled" : ""}`} htmlFor="book-file">
+                {isUploadingBook ? (
+                  <LoaderCircle aria-hidden="true" size={18} className="spin" />
+                ) : (
+                  <Upload aria-hidden="true" size={18} />
+                )}
+                <span>{isUploadingBook ? "Saving EPUB..." : "Upload EPUB file"}</span>
+              </label>
+              <input
+                ref={fileInputRef}
+                id="book-file"
+                className="file-input"
+                type="file"
+                accept=".epub,application/epub+zip"
+                onChange={(event) => void addBookFromFile(event)}
+                disabled={isUploadingBook}
+              />
+            </div>
           </form>
         </div>
       )}
-    </main>
+    </div>
   );
 }
 
